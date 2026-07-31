@@ -79,6 +79,7 @@ use wayland_server::protocol::{wl_buffer, wl_shm, wl_surface::WlSurface};
 
 #[cfg(all(feature = "backend_gbm", feature = "backend_egl", feature = "renderer_gl"))]
 pub mod gbm;
+pub mod vkbridge;
 
 /// Tracks available gpus from a given [`GraphicsApi`]
 #[derive(Debug)]
@@ -337,6 +338,7 @@ impl<A: GraphicsApi> GpuManager<A> {
                         .entry((*render_device, *target_device))
                         .or_default(),
                     format: copy_format,
+                    bridge: None,
                 }),
                 other_renderers: others,
                 span: tracing::Span::current(),
@@ -430,6 +432,7 @@ impl<A: GraphicsApi> GpuManager<A> {
                         .entry((*render_device, *target_device))
                         .or_default(),
                     format: copy_format,
+                    bridge: None,
                 }),
                 other_renderers: others,
                 span: tracing::Span::current(),
@@ -913,6 +916,7 @@ struct TargetData<'target, T: GraphicsApi> {
     device: &'target mut T::Device,
     cached_buffer: &'target mut Option<(bool, Dmabuf)>,
     format: Fourcc,
+    bridge: Option<vkbridge::VkBridge>,
 }
 
 struct TargetFrameData<'target, 'frame, 'buffer, T: GraphicsApi> {
@@ -920,6 +924,10 @@ struct TargetFrameData<'target, 'frame, 'buffer, T: GraphicsApi> {
     framebuffer: &'frame mut <<T::Device as ApiDevice>::Renderer as RendererSuper>::Framebuffer<'buffer>,
     texture: Option<<<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>,
     format: Fourcc,
+    /// The staging buffer the frame is being rendered into on the render gpu
+    /// (only needed by the vulkan bridge path).
+    dmabuf: Option<Dmabuf>,
+    bridge: Option<&'frame mut vkbridge::VkBridge>,
 }
 
 impl<'frame, 'buffer, R: GraphicsApi + 'frame, T: GraphicsApi> fmt::Debug
@@ -1238,6 +1246,10 @@ where
                             // drop everything
                         }
 
+                        if target.bridge.is_none() {
+                            target.bridge = vkbridge::VkBridge::new(*self.render.node()).ok();
+                        }
+
                         *target.cached_buffer = Some((false, dmabuf));
                     }
                 }
@@ -1255,9 +1267,11 @@ where
                         .map_err(Error::Target)
                 })
                 .transpose()?;
+            let staging_dmabuf = dmabuf.clone();
             let framebuffer = self.render.renderer_mut().bind(dmabuf).map_err(Error::Render)?;
+            let bridge = target.bridge.as_mut();
 
-            Some((&mut target.device, framebuffer, texture, target.format))
+            Some((&mut target.device, framebuffer, texture, target.format, staging_dmabuf, bridge))
         } else {
             None
         };
@@ -1282,12 +1296,15 @@ where
                     .map_err(Error::Render)?
             }
             MultiFramebufferInternal::Target(target_framebuffer) => {
-                let (target_device, render_framebuffer, texture, format) = target_state.unwrap();
+                let (target_device, render_framebuffer, texture, format, staging_dmabuf, bridge) =
+                    target_state.unwrap();
                 target = Some(TargetFrameData {
                     device: target_device,
                     framebuffer: target_framebuffer,
                     texture,
                     format,
+                    dmabuf: Some(staging_dmabuf),
+                    bridge,
                 });
                 let mut render_framebuffer = AliasableBox::from_unique(Box::new(render_framebuffer));
 
@@ -1557,42 +1574,74 @@ where
                     copy_rects = Vec::from([Rectangle::from_size(buffer_size)]);
                 }
 
-                let mut mappings = Vec::new();
-                for rect in copy_rects {
-                    let mapping = (
-                        ExportMem::copy_framebuffer(
-                            render.renderer_mut(),
-                            self.framebuffer.as_ref().unwrap(),
-                            rect,
-                            format,
-                        )
-                        .map_err(Error::Render)?,
-                        rect,
-                    );
-                    mappings.push(mapping);
-                }
-
-                if mappings.is_empty() {
-                    render
-                        .renderer_mut()
-                        .cleanup_texture_cache()
-                        .map_err(Error::Render)?;
-                    return Ok(sync::SyncPoint::signaled());
-                }
-
-                let textures = mappings
-                    .into_iter()
-                    .map(|(mapping, rect)| {
-                        let slice = ExportMem::map_texture(render.renderer_mut(), &mapping)
-                            .map_err(Error::Render::<R, T>)?;
-                        let texture = target
+                // Try the vulkan bridge first: an on-GPU copy of the staging buffer
+                // into a target-importable (linear) dmabuf, avoiding the cpu readback
+                // entirely. Falls back to the cpu copy below on any failure.
+                let bridged_texture = target
+                    .bridge
+                    .as_mut()
+                    .zip(target.dmabuf.as_ref())
+                    .and_then(|(bridge, staging)| {
+                        // ensure all rendering into the staging buffer has completed
+                        // (v1: conservative blocking wait on the render sync point)
+                        if sync.wait().is_err() {
+                            return None;
+                        }
+                        bridge.copy_to_linear(staging).ok()
+                    })
+                    .and_then(|linear| {
+                        target
                             .device
                             .renderer_mut()
-                            .import_memory(slice, TextureMapping::format(&mapping), rect.size, false)
-                            .map_err(Error::Target)?;
-                        Ok((texture, rect))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                            .import_dmabuf(&linear, Some(&[Rectangle::from_size(buffer_size)]))
+                            .map_err(|err| {
+                                warn!("vulkan bridge: failed to import linear dmabuf on target: {err}");
+                                err
+                            })
+                            .ok()
+                    });
+
+                let textures = if let Some(texture) = bridged_texture {
+                    debug!("vulkan bridge: using on-gpu cross-device copy");
+                    vec![(texture, Rectangle::from_size(buffer_size))]
+                } else {
+                    let mut mappings = Vec::new();
+                    for rect in copy_rects {
+                        let mapping = (
+                            ExportMem::copy_framebuffer(
+                                render.renderer_mut(),
+                                self.framebuffer.as_ref().unwrap(),
+                                rect,
+                                format,
+                            )
+                            .map_err(Error::Render)?,
+                            rect,
+                        );
+                        mappings.push(mapping);
+                    }
+
+                    if mappings.is_empty() {
+                        render
+                            .renderer_mut()
+                            .cleanup_texture_cache()
+                            .map_err(Error::Render)?;
+                        return Ok(sync::SyncPoint::signaled());
+                    }
+
+                    mappings
+                        .into_iter()
+                        .map(|(mapping, rect)| {
+                            let slice = ExportMem::map_texture(render.renderer_mut(), &mapping)
+                                .map_err(Error::Render::<R, T>)?;
+                            let texture = target
+                                .device
+                                .renderer_mut()
+                                .import_memory(slice, TextureMapping::format(&mapping), rect.size, false)
+                                .map_err(Error::Target)?;
+                            Ok((texture, rect))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                };
 
                 let mut frame = target
                     .device
