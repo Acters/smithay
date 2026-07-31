@@ -1628,38 +1628,52 @@ where
 
                 // Try the vulkan bridge first: an on-GPU copy of the staging buffer
                 // into a target-importable (linear) dmabuf, avoiding the cpu readback
-                // entirely. Falls back to the cpu copy below on any failure.
+                // entirely. Synchronization is fully gpu-side: the copy waits on the
+                // exported render fence and produces a fence for the consumer.
+                // Falls back to the cpu copy below on any failure.
                 let bridged_texture = target
                     .bridge
                     .as_mut()
                     .zip(target.dmabuf.as_ref())
                     .and_then(|(bridge, staging)| {
-                        // ensure all rendering into the staging buffer has completed
-                        // (v1: conservative blocking wait on the render sync point)
-                        debug!("vkbridge: waiting on render sync point");
+                        // v1.5 hybrid sync: block the CPU on the render fence
+                        // (cheap; frame usually nearly done), but never
+                        // vkQueueWaitIdle — the consumer waits gpu-side on the
+                        // exported copy fence. (NVIDIA's vulkan driver rejects
+                        // importing EGL-exported native fence fds, so a true
+                        // render->copy gpu-side wait is not possible this way.)
                         if sync.wait().is_err() {
                             return None;
                         }
-                        debug!("vkbridge: sync reached, starting copy");
-                        let res = bridge.copy_to_linear(staging).ok();
-                        debug!("vkbridge: copy returned: {}", res.is_some());
+                        let res = bridge
+                            .copy_to_linear_async(staging, None, &copy_rects)
+                            .map_err(|err| {
+                                warn!("vkbridge: copy error: {err}");
+                                err
+                            })
+                            .ok();
                         res
                     })
-                    .and_then(|linear| {
-                        target
+                    .and_then(|(linear, fence_fd)| {
+                        match target
                             .device
                             .renderer_mut()
                             .import_dmabuf(&linear, Some(&[Rectangle::from_size(buffer_size)]))
-                            .map_err(|err| {
+                        {
+                            Ok(texture) => Some((
+                                texture,
+                                sync::SyncPoint::from(vkbridge::NativeFdFence::new(fence_fd)),
+                            )),
+                            Err(err) => {
                                 warn!("vulkan bridge: failed to import linear dmabuf on target: {err}");
-                                err
-                            })
-                            .ok()
+                                None
+                            }
+                        }
                     });
 
-                let textures = if let Some(texture) = bridged_texture {
+                let (textures, copy_sync) = if let Some((texture, sp)) = bridged_texture {
                     debug!("vulkan bridge: using on-gpu cross-device copy");
-                    vec![(texture, Rectangle::from_size(buffer_size))]
+                    (vec![(texture, Rectangle::from_size(buffer_size))], Some(sp))
                 } else {
                     let mut mappings = Vec::new();
                     for rect in copy_rects {
@@ -1684,7 +1698,7 @@ where
                         return Ok(sync::SyncPoint::signaled());
                     }
 
-                    mappings
+                    let textures = mappings
                         .into_iter()
                         .map(|(mapping, rect)| {
                             let slice = ExportMem::map_texture(render.renderer_mut(), &mapping)
@@ -1696,7 +1710,8 @@ where
                                 .map_err(Error::Target)?;
                             Ok((texture, rect))
                         })
-                        .collect::<Result<Vec<_>, _>>()?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    (textures, None)
                 };
 
                 let mut frame = target
@@ -1704,6 +1719,10 @@ where
                     .renderer_mut()
                     .render(target.framebuffer, self.size, Transform::Normal)
                     .map_err(Error::Target)?;
+                if let Some(sp) = &copy_sync {
+                    // gpu-side wait on the vulkan copy fence before sampling
+                    frame.wait(sp).map_err(Error::Target)?;
+                }
                 for (texture, rect) in textures {
                     for damage_rect in damage.iter().filter_map(|dmg_rect| dmg_rect.intersection(rect)) {
                         let dst = damage_rect

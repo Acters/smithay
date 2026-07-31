@@ -17,7 +17,7 @@
 //! (e.g. by blocking on the render [`crate::backend::renderer::sync::SyncPoint`]),
 //! and this bridge blocks (`vkQueueWaitIdle`) before returning the exported dmabuf.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 
 use ash::{ext, khr, vk};
 use drm_fourcc::DrmModifier;
@@ -31,6 +31,7 @@ use crate::backend::{
     },
     drm::DrmNode,
 };
+use crate::utils::{Buffer as BufferCoord, Rectangle};
 
 // ---------------------------------------------------------------------------
 // Early (pre-DRM-master) initialization support.
@@ -104,7 +105,12 @@ pub struct VkBridge {
     queue: vk::Queue,
     queue_family: u32,
     cmd_pool: vk::CommandPool,
+    /// Fences exported to consumers; kept alive for a frame because the nvidia
+    /// driver orphans exported fence fds if the VkFence is destroyed too early.
+    pending_fences: Vec<vk::Fence>,
     get_memory_fd: khr::external_memory_fd::Device,
+    get_semaphore_fd: khr::external_semaphore_fd::Device,
+    get_fence_fd: khr::external_fence_fd::Device,
 }
 
 impl VkBridge {
@@ -198,6 +204,10 @@ impl VkBridge {
             ext::image_drm_format_modifier::NAME.as_ptr(),
             ext::external_memory_dma_buf::NAME.as_ptr(),
             khr::external_memory_fd::NAME.as_ptr(),
+            khr::external_semaphore::NAME.as_ptr(),
+            khr::external_semaphore_fd::NAME.as_ptr(),
+            khr::external_fence::NAME.as_ptr(),
+            khr::external_fence_fd::NAME.as_ptr(),
         ];
         let device = unsafe {
             instance.create_device(
@@ -220,6 +230,8 @@ impl VkBridge {
         }?;
         info!("vkbridge: queue + cmd pool ok");
         let get_memory_fd = khr::external_memory_fd::Device::new(&instance, &device);
+        let get_semaphore_fd = khr::external_semaphore_fd::Device::new(&instance, &device);
+        let get_fence_fd = khr::external_fence_fd::Device::new(&instance, &device);
 
         info!("vkbridge: initialized");
         Ok(VkBridge {
@@ -230,17 +242,30 @@ impl VkBridge {
             queue,
             queue_family,
             cmd_pool,
+            pending_fences: Vec::new(),
             get_memory_fd,
+            get_semaphore_fd,
+            get_fence_fd,
         })
     }
 
     /// Copy `src` (any modifier, single plane) into a newly allocated LINEAR dmabuf
-    /// of identical format and size, entirely on-GPU.
+    /// of identical format and size, entirely on-GPU, without blocking the CPU.
     ///
-    /// The caller must ensure all rendering into `src` has completed before calling
-    /// this function. The function blocks until the copy is complete, so the
-    /// returned dmabuf is immediately usable.
-    pub fn copy_to_linear(&mut self, src: &Dmabuf) -> Result<Dmabuf, VkBridgeError> {
+    /// `wait_fd` is an optional native fence fd the copy must wait on (the render
+    /// frame's sync point, exported); it is consumed by this call. The returned
+    /// fd is a native fence fd that signals when the copy is complete; the caller
+    /// must make the consumer wait on it before sampling the returned dmabuf.
+    ///
+    /// `regions` limits the copy to the given rectangles (empty = full buffer).
+    /// The blocking `vkQueueWaitIdle` of v1 is gone: all synchronization is
+    /// fd-based (v2 explicit sync).
+    pub fn copy_to_linear_async(
+        &mut self,
+        src: &Dmabuf,
+        wait_fd: Option<OwnedFd>,
+        regions: &[Rectangle<i32, BufferCoord>],
+    ) -> Result<(Dmabuf, OwnedFd), VkBridgeError> {
         if src.num_planes() != 1 {
             return Err(VkBridgeError::Unsupported);
         }
@@ -298,7 +323,14 @@ impl VkBridge {
         let mut src_image = Some(src_image);
 
         let _ = vk_format; // layout is fully described by the drm modifier
-        let result = self.copy_inner(src, src_fd.as_raw_fd(), &mut src_image, &mut dst_image);
+        let result = self.copy_inner(
+            src,
+            src_fd.as_raw_fd(),
+            &mut src_image,
+            &mut dst_image,
+            wait_fd,
+            regions,
+        );
 
         // cleanup images regardless of outcome
         if let Some(img) = src_image.take() {
@@ -311,12 +343,14 @@ impl VkBridge {
     }
 
     fn copy_inner(
-        &self,
+        &mut self,
         src: &Dmabuf,
         src_fd: std::os::fd::RawFd,
         src_image: &mut Option<vk::Image>,
         dst_image: &mut Option<vk::Image>,
-    ) -> Result<Dmabuf, VkBridgeError> {
+        wait_fd: Option<OwnedFd>,
+        regions: &[Rectangle<i32, BufferCoord>],
+    ) -> Result<(Dmabuf, OwnedFd), VkBridgeError> {
         let (w, h) = (src.size().w as u32, src.size().h as u32);
         let format = src.format().code;
         let flags = DmabufFlags::empty();
@@ -368,6 +402,11 @@ impl VkBridge {
         unsafe { self.device.bind_image_memory(src_img, src_mem, 0)? };
 
         // record and submit the copy
+        // retire previous frames' fences; consumers had a frame to import them
+        for fence in self.pending_fences.drain(..) {
+            unsafe { self.device.destroy_fence(fence, None) };
+        }
+
         let cmd = unsafe {
             self.device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
@@ -376,7 +415,7 @@ impl VkBridge {
                     .command_buffer_count(1),
             )?[0]
         };
-        let submit_result = (|| -> Result<(), VkBridgeError> {
+        let submit_result = (|| -> Result<OwnedFd, VkBridgeError> {
             unsafe {
                 self.device.begin_command_buffer(
                     cmd,
@@ -424,35 +463,107 @@ impl VkBridge {
                     &[],
                     &barriers,
                 );
-                let region = vk::ImageCopy::default()
-                    .src_subresource(vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: 0,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    })
-                    .dst_subresource(vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: 0,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    })
-                    .extent(vk::Extent3D { width: w, height: h, depth: 1 });
+                let subresource = |mip_level| vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                let copy_regions: Vec<vk::ImageCopy> = if regions.is_empty() {
+                    vec![vk::ImageCopy::default()
+                        .src_subresource(subresource(0))
+                        .dst_subresource(subresource(0))
+                        .extent(vk::Extent3D { width: w, height: h, depth: 1 })]
+                } else {
+                    regions
+                        .iter()
+                        .map(|rect| {
+                            vk::ImageCopy::default()
+                                .src_subresource(subresource(0))
+                                .src_offset(vk::Offset3D { x: rect.loc.x, y: rect.loc.y, z: 0 })
+                                .dst_subresource(subresource(0))
+                                .dst_offset(vk::Offset3D { x: rect.loc.x, y: rect.loc.y, z: 0 })
+                                .extent(vk::Extent3D {
+                                    width: rect.size.w as u32,
+                                    height: rect.size.h as u32,
+                                    depth: 1,
+                                })
+                        })
+                        .collect()
+                };
                 self.device.cmd_copy_image(
                     cmd,
                     src_img,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     dst,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[region],
+                    &copy_regions,
                 );
                 self.device.end_command_buffer(cmd)?;
+
+                // explicit sync: wait on the render fence (imported as a temporary
+                // semaphore), signal an exportable fence for the consumer.
+                let semaphore = wait_fd
+                    .map(|fd| -> Result<vk::Semaphore, VkBridgeError> {
+                        debug!("vkbridge: creating semaphore + importing fence fd");
+                        let semaphore = unsafe {
+                            self.device
+                                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?
+                        };
+                        debug!("vkbridge: semaphore created, importing fd");
+                        let import = vk::ImportSemaphoreFdInfoKHR::default()
+                            .semaphore(semaphore)
+                            .flags(vk::SemaphoreImportFlags::TEMPORARY)
+                            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD)
+                            .fd(fd.into_raw_fd());
+                        unsafe { self.get_semaphore_fd.import_semaphore_fd(&import)? };
+                        debug!("vkbridge: fence fd imported into semaphore");
+                        Ok(semaphore)
+                    })
+                    .transpose()?;
+                debug!("vkbridge: render fence semaphore ready: {}", semaphore.is_some());
+
+                let mut export_fence_info = vk::ExportFenceCreateInfo::default()
+                    .handle_types(vk::ExternalFenceHandleTypeFlags::OPAQUE_FD);
+                let fence = unsafe {
+                    self.device.create_fence(
+                        &vk::FenceCreateInfo::default().push_next(&mut export_fence_info),
+                        None,
+                    )?
+                };
+
                 let cmds = [cmd];
-                let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-                self.device.queue_submit(self.queue, &[submit], vk::Fence::null())?;
-                self.device.queue_wait_idle(self.queue)?;
+                let wait_semaphores: Vec<vk::Semaphore> = semaphore.into_iter().collect();
+                let wait_stages = [vk::PipelineStageFlags::TRANSFER];
+                let mut submit = vk::SubmitInfo::default().command_buffers(&cmds);
+                if !wait_semaphores.is_empty() {
+                    // wait stages must correspond 1:1 with wait semaphores;
+                    // setting a mask without semaphores is a spec violation
+                    // that crashes the nvidia driver.
+                    submit = submit
+                        .wait_semaphores(&wait_semaphores)
+                        .wait_dst_stage_mask(&wait_stages);
+                }
+                debug!(
+                    "vkbridge: submitting copy (wait_semaphore={}, export fence)",
+                    !wait_semaphores.is_empty()
+                );
+                self.device.queue_submit(self.queue, &[submit], fence)?;
+                debug!("vkbridge: submit ok, exporting fence fd");
+
+                if let Some(sem) = semaphore {
+                    unsafe { self.device.destroy_semaphore(sem, None) };
+                }
+                let out_fd = unsafe {
+                    self.get_fence_fd.get_fence_fd(
+                        &vk::FenceGetFdInfoKHR::default()
+                            .fence(fence)
+                            .handle_type(vk::ExternalFenceHandleTypeFlags::OPAQUE_FD),
+                    )?
+                };
+                self.pending_fences.push(fence);
+                Ok(unsafe { OwnedFd::from_raw_fd(out_fd) })
             }
-            Ok(())
         })();
 
         // free command buffer + src memory/image handles; export dst regardless of outcome only on success
@@ -460,7 +571,7 @@ impl VkBridge {
             self.device.free_command_buffers(self.cmd_pool, &[cmd]);
             self.device.free_memory(src_mem, None);
         }
-        submit_result?;
+        let copy_fence = submit_result?;
 
         // export dst as dmabuf
         let fd = unsafe {
@@ -487,7 +598,7 @@ impl VkBridge {
         }
         let dmabuf = builder.build().ok_or(VkBridgeError::Export)?;
         debug!("vkbridge: copied {}x{} {:?} -> linear dmabuf", w, h, format);
-        Ok(dmabuf)
+        Ok((dmabuf, copy_fence))
     }
 
     fn mem_type(&self, bits: u32, required: vk::MemoryPropertyFlags) -> Option<u32> {
@@ -502,6 +613,9 @@ impl VkBridge {
 impl Drop for VkBridge {
     fn drop(&mut self) {
         unsafe {
+            for fence in self.pending_fences.drain(..) {
+                self.device.destroy_fence(fence, None);
+            }
             self.device.destroy_command_pool(self.cmd_pool, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
@@ -513,5 +627,51 @@ impl Drop for VkBridge {
 impl std::fmt::Debug for VkBridge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VkBridge").finish_non_exhaustive()
+    }
+}
+
+/// A native fence fd wrapped as a smithay [`Fence`](crate::backend::renderer::sync::Fence),
+/// letting consumers wait on a vulkan-produced fence through the usual
+/// [`SyncPoint`](crate::backend::renderer::sync::SyncPoint) paths (including
+/// server-side waits after EGL import).
+#[derive(Debug)]
+pub struct NativeFdFence(OwnedFd);
+
+impl NativeFdFence {
+    /// Wrap an owned native fence fd.
+    pub fn new(fd: OwnedFd) -> Self {
+        Self(fd)
+    }
+}
+
+impl crate::backend::renderer::sync::Fence for NativeFdFence {
+    fn is_signaled(&self) -> bool {
+        let mut pfd = libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        unsafe { libc::poll(&mut pfd, 1, 0) > 0 }
+    }
+
+    fn wait(&self) -> Result<(), crate::backend::renderer::sync::Interrupted> {
+        let mut pfd = libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pfd, 1, -1) } < 0 {
+            return Err(crate::backend::renderer::sync::Interrupted);
+        }
+        Ok(())
+    }
+
+    fn is_exportable(&self) -> bool {
+        true
+    }
+
+    fn export(&self) -> Option<OwnedFd> {
+        let fd = unsafe { libc::dup(self.0.as_raw_fd()) };
+        (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
     }
 }
