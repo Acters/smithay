@@ -1317,6 +1317,14 @@ where
             }
 
             let staging_dmabuf = dmabuf.clone();
+            // before re-rendering into the (persistent) staging buffer, wait
+            // for the copy worker to finish consuming it (bounded: the worker
+            // usually finished long ago; never a full pipeline stall)
+            if let BridgeState::Ready(bridge) = &mut *target.bridge {
+                if !*direct {
+                    bridge.wait_for_pending_copies();
+                }
+            }
             let framebuffer = self.render.renderer_mut().bind(dmabuf).map_err(Error::Render)?;
             let bridge = match &mut *target.bridge {
                 BridgeState::Ready(bridge) => Some(bridge),
@@ -1626,25 +1634,25 @@ where
                     copy_rects = Vec::from([Rectangle::from_size(buffer_size)]);
                 }
 
-                // Try the vulkan bridge first: an on-GPU copy of the staging buffer
-                // into a target-importable (linear) dmabuf, avoiding the cpu readback
-                // entirely. Falls back to the cpu copy below on any failure.
+                // v3 pipeline: submit this frame's staging buffer to the copy
+                // worker (never blocks the compositor) and consume the latest
+                // completed copy (typically the previous frame). The render
+                // sync point is awaited on the worker thread; no cross-driver
+                // fences are used. The target output lags one frame behind.
+                // NOTE: full-frame copies for now. Damage-region copies must
+                // not be paired with this frame's damage list: the completed
+                // buffer we composite here is one frame old, so its valid
+                // regions would not cover this frame's damage, sampling
+                // uninitialized garbage (the "cycling glitched frame" bug).
+                if let Some(bridge) = target.bridge.as_mut() {
+                    if let Some(staging) = target.dmabuf.clone() {
+                        bridge.submit_copy(staging, sync.clone(), Vec::new());
+                    }
+                }
                 let bridged_texture = target
                     .bridge
                     .as_mut()
-                    .zip(target.dmabuf.as_ref())
-                    .and_then(|(bridge, staging)| {
-                        // ensure all rendering into the staging buffer has completed
-                        // (v1: conservative blocking wait on the render sync point)
-                        debug!("vkbridge: waiting on render sync point");
-                        if sync.wait().is_err() {
-                            return None;
-                        }
-                        debug!("vkbridge: sync reached, starting copy");
-                        let res = bridge.copy_to_linear(staging).ok();
-                        debug!("vkbridge: copy returned: {}", res.is_some());
-                        res
-                    })
+                    .and_then(|bridge| bridge.latest_completed())
                     .and_then(|linear| {
                         target
                             .device
@@ -1658,8 +1666,18 @@ where
                     });
 
                 let textures = if let Some(texture) = bridged_texture {
-                    debug!("vulkan bridge: using on-gpu cross-device copy");
+                    // The bridge copy lags one frame behind, so damage-limited
+                    // blits make the target swapchain buffers diverge (every
+                    // other buffer showing a one-frame-older base image: the
+                    // "rhythmic old frame" flicker). Always repaint the full
+                    // target from the completed copy.
+                    damage = vec![Rectangle::from_size(buffer_size)];
                     vec![(texture, Rectangle::from_size(buffer_size))]
+                } else if target.bridge.is_some() {
+                    // bridge is ready but hasn't completed its first copy yet;
+                    // skip this frame instead of hitting the (broken on this
+                    // stack) cpu readback path
+                    return Ok(sync::SyncPoint::signaled());
                 } else {
                     let mut mappings = Vec::new();
                     for rect in copy_rects {
