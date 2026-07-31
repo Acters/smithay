@@ -87,6 +87,7 @@ pub struct GpuManager<A: GraphicsApi> {
     api: A,
     devices: Vec<A::Device>,
     dmabuf_cache: HashMap<(DrmNode, DrmNode), Option<(bool, Dmabuf)>>,
+    bridge: BridgeState,
     span: tracing::Span,
 }
 
@@ -230,6 +231,7 @@ impl<A: GraphicsApi> GpuManager<A> {
             api,
             devices,
             dmabuf_cache: HashMap::new(),
+            bridge: BridgeState::NotTried,
             span,
         })
     }
@@ -338,7 +340,7 @@ impl<A: GraphicsApi> GpuManager<A> {
                         .entry((*render_device, *target_device))
                         .or_default(),
                     format: copy_format,
-                    bridge: None,
+                    bridge: &mut self.bridge,
                 }),
                 other_renderers: others,
                 span: tracing::Span::current(),
@@ -372,6 +374,8 @@ impl<A: GraphicsApi> GpuManager<A> {
     where
         <A::Device as ApiDevice>::Renderer: Bind<Dmabuf>,
         <B::Device as ApiDevice>::Renderer: ImportDma,
+        // the vulkan bridge state is borrowed from the render gpu's manager
+        'render: 'target,
     {
         if !render_api
             .devices
@@ -432,7 +436,7 @@ impl<A: GraphicsApi> GpuManager<A> {
                         .entry((*render_device, *target_device))
                         .or_default(),
                     format: copy_format,
-                    bridge: None,
+                    bridge: &mut render_api.bridge,
                 }),
                 other_renderers: others,
                 span: tracing::Span::current(),
@@ -912,11 +916,26 @@ where
     span: tracing::span::EnteredSpan,
 }
 
+/// State of the lazy vulkan bridge initialization.
+///
+/// Initialization happens on a background thread: on some driver stacks
+/// `vkCreateInstance` can block indefinitely inside the ICD (observed with
+/// proprietary NVIDIA inside a compositor process holding DRM master), and
+/// this must never block the compositor's main loop.
+
+#[derive(Debug)]
+enum BridgeState {
+    NotTried,
+    Initializing(std::sync::mpsc::Receiver<Result<vkbridge::VkBridge, vkbridge::VkBridgeError>>),
+    Ready(vkbridge::VkBridge),
+    Failed,
+}
+
 struct TargetData<'target, T: GraphicsApi> {
     device: &'target mut T::Device,
     cached_buffer: &'target mut Option<(bool, Dmabuf)>,
     format: Fourcc,
-    bridge: Option<vkbridge::VkBridge>,
+    bridge: &'target mut BridgeState,
 }
 
 struct TargetFrameData<'target, 'frame, 'buffer, T: GraphicsApi> {
@@ -1246,8 +1265,19 @@ where
                             // drop everything
                         }
 
-                        if target.bridge.is_none() {
-                            target.bridge = vkbridge::VkBridge::new(*self.render.node()).ok();
+                        if matches!(*target.bridge, BridgeState::NotTried) {
+                            *target.bridge = if let Some(rx) = vkbridge::take_preinit() {
+                                info!("vkbridge: using pre-initialized bridge receiver");
+                                BridgeState::Initializing(rx)
+                            } else {
+                                let node = *self.render.node();
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                info!("vkbridge: spawning init thread");
+                                std::thread::spawn(move || {
+                                    let _ = tx.send(vkbridge::VkBridge::new(node));
+                                });
+                                BridgeState::Initializing(rx)
+                            };
                         }
 
                         *target.cached_buffer = Some((false, dmabuf));
@@ -1267,9 +1297,31 @@ where
                         .map_err(Error::Target)
                 })
                 .transpose()?;
+            // advance the (background) bridge init, if one is in flight
+            let init_result = match &mut *target.bridge {
+                BridgeState::Initializing(rx) => match rx.try_recv() {
+                    Ok(Ok(bridge)) => {
+                        info!("vkbridge: init completed");
+                        Some(BridgeState::Ready(bridge))
+                    }
+                    Ok(Err(err)) => {
+                        warn!("vkbridge: init failed: {err}");
+                        Some(BridgeState::Failed)
+                    }
+                    Err(_) => None,
+                },
+                _ => None,
+            };
+            if let Some(state) = init_result {
+                *target.bridge = state;
+            }
+
             let staging_dmabuf = dmabuf.clone();
             let framebuffer = self.render.renderer_mut().bind(dmabuf).map_err(Error::Render)?;
-            let bridge = target.bridge.as_mut();
+            let bridge = match &mut *target.bridge {
+                BridgeState::Ready(bridge) => Some(bridge),
+                _ => None,
+            };
 
             Some((&mut target.device, framebuffer, texture, target.format, staging_dmabuf, bridge))
         } else {
@@ -1584,10 +1636,14 @@ where
                     .and_then(|(bridge, staging)| {
                         // ensure all rendering into the staging buffer has completed
                         // (v1: conservative blocking wait on the render sync point)
+                        debug!("vkbridge: waiting on render sync point");
                         if sync.wait().is_err() {
                             return None;
                         }
-                        bridge.copy_to_linear(staging).ok()
+                        debug!("vkbridge: sync reached, starting copy");
+                        let res = bridge.copy_to_linear(staging).ok();
+                        debug!("vkbridge: copy returned: {}", res.is_some());
+                        res
                     })
                     .and_then(|linear| {
                         target

@@ -32,6 +32,43 @@ use crate::backend::{
     drm::DrmNode,
 };
 
+// ---------------------------------------------------------------------------
+// Early (pre-DRM-master) initialization support.
+//
+// On proprietary NVIDIA, creating a vulkan instance from *inside* a compositor
+// process that already holds DRM master deadlocks the ICD. Initializing on a
+// background thread spawned before the compositor opens its DRM devices avoids
+// this. niri (or another compositor) should call [`preinit`] as early as
+// possible in main(); the multigpu renderer picks the result up later.
+// ---------------------------------------------------------------------------
+
+type InitResult = Result<VkBridge, VkBridgeError>;
+static PREINIT: std::sync::Mutex<Option<std::sync::mpsc::Receiver<InitResult>>> =
+    std::sync::Mutex::new(None);
+
+/// Spawn the bridge initialization thread early. `vendor_id` selects the
+/// physical device to use (e.g. 0x10de for NVIDIA); pass `None` to use the
+/// first device that reports a render node.
+pub fn preinit(vendor_id: Option<u32>) {
+    let mut guard = PREINIT.lock().unwrap();
+    if guard.is_some() {
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("vkbridge-init".into())
+        .spawn(move || {
+            let _ = tx.send(VkBridge::new_for_vendor(vendor_id));
+        })
+        .expect("failed to spawn vkbridge init thread");
+    *guard = Some(rx);
+}
+
+/// Take the pre-initialization receiver, if [`preinit`] was called.
+pub fn take_preinit() -> Option<std::sync::mpsc::Receiver<InitResult>> {
+    PREINIT.lock().unwrap().take()
+}
+
 /// Error type for [`VkBridge`] operations.
 #[derive(Debug, thiserror::Error)]
 pub enum VkBridgeError {
@@ -76,42 +113,65 @@ impl VkBridge {
     /// Returns an error if no matching vulkan physical device exists or device
     /// creation fails; callers should fall back to the cpu-copy in that case.
     pub fn new(node: DrmNode) -> Result<Self, VkBridgeError> {
+        Self::init_with(|_vendor, major, minor| major == node.major() as i64 && minor == node.minor() as i64)
+    }
+
+    /// Create a bridge selecting the physical device by PCI vendor id.
+    ///
+    /// `None` picks the first device that is not Intel (0x8086) — i.e. the
+    /// "discrete" gpu on hybrid laptops — falling back to the first device
+    /// with a render node. Used by [`preinit`], where no DRM node is known yet.
+    pub fn new_for_vendor(vendor_id: Option<u32>) -> Result<Self, VkBridgeError> {
+        Self::init_with(|vendor, _major, _minor| match vendor_id {
+            Some(want) => vendor == want,
+            None => vendor != 0x8086,
+        })
+    }
+
+    fn init_with(matcher: impl Fn(u32, i64, i64) -> bool) -> Result<Self, VkBridgeError> {
+        info!("vkbridge: init start");
         let entry = unsafe { ash::Entry::load() }
             .map_err(|err| VkBridgeError::Setup(format!("failed to load vulkan: {err}")))?;
+        info!("vkbridge: loader ok");
 
         let app_info = vk::ApplicationInfo::default()
             .application_name(c"smithay-vkbridge")
             .api_version(vk::API_VERSION_1_3);
-        let instance_extensions = [ext::physical_device_drm::NAME.as_ptr()];
+        // NOTE: VK_EXT_physical_device_drm is intentionally *not* enabled here.
+        // The proprietary NVIDIA driver does not advertise it as an instance
+        // extension (instance creation fails with ERROR_EXTENSION_NOT_PRESENT),
+        // yet it fills in VkPhysicalDeviceDrmPropertiesEXT just fine without it.
         let instance = unsafe {
             entry.create_instance(
-                &vk::InstanceCreateInfo::default()
-                    .application_info(&app_info)
-                    .enabled_extension_names(&instance_extensions),
+                &vk::InstanceCreateInfo::default().application_info(&app_info),
                 None,
             )
         }?;
+        info!("vkbridge: instance created");
 
         let phds = unsafe { instance.enumerate_physical_devices()? };
+        info!("vkbridge: enumerated {} physical devices", phds.len());
         let mut phd = None;
         for candidate in phds {
-            let (drm_props, device_name) = {
+            let (has_render, render_major, render_minor, vendor_id) = {
                 let mut drm_props = vk::PhysicalDeviceDrmPropertiesEXT::default();
-                let mut props =
-                    vk::PhysicalDeviceProperties2::default().push_next(&mut drm_props);
-                unsafe { instance.get_physical_device_properties2(candidate, &mut props) };
-                let name = props
-                    .properties
-                    .device_name_as_c_str()
-                    .map(|s| s.to_owned())
-                    .unwrap_or_default();
-                (drm_props, name)
+                let vendor_id = {
+                    let mut props =
+                        vk::PhysicalDeviceProperties2::default().push_next(&mut drm_props);
+                    unsafe { instance.get_physical_device_properties2(candidate, &mut props) };
+                    props.properties.vendor_id
+                };
+                (
+                    drm_props.has_render,
+                    drm_props.render_major,
+                    drm_props.render_minor,
+                    vendor_id,
+                )
             };
-            if drm_props.has_render == vk::TRUE
-                && drm_props.render_major == node.major() as i64
-                && drm_props.render_minor == node.minor() as i64
-            {
-                debug!("vkbridge: using physical device {:?} for {:?}", device_name, node);
+            debug!(
+                "vkbridge: phd vendor=0x{vendor_id:04x} render={render_major}:{render_minor}",
+            );
+            if has_render == vk::TRUE && matcher(vendor_id, render_major, render_minor) {
                 phd = Some(candidate);
                 break;
             }
@@ -148,6 +208,7 @@ impl VkBridge {
                 None,
             )
         }?;
+        info!("vkbridge: device created");
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         let cmd_pool = unsafe {
             device.create_command_pool(
@@ -157,9 +218,10 @@ impl VkBridge {
                 None,
             )
         }?;
+        info!("vkbridge: queue + cmd pool ok");
         let get_memory_fd = khr::external_memory_fd::Device::new(&instance, &device);
 
-        info!("vkbridge: initialized for node {:?}", node);
+        info!("vkbridge: initialized");
         Ok(VkBridge {
             entry,
             instance,
@@ -445,5 +507,11 @@ impl Drop for VkBridge {
             self.instance.destroy_instance(None);
         }
         let _ = &self.entry;
+    }
+}
+
+impl std::fmt::Debug for VkBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VkBridge").finish_non_exhaustive()
     }
 }
