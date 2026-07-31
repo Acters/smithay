@@ -111,7 +111,11 @@ struct CopyState {
     /// consumer on the target gpu is at most ~2 frames behind, so reuse is
     /// safe. Avoids per-frame create/alloc/free churn in the nvidia driver.
     dst_key: Option<(vk::Format, u32, u32)>,
-    dst_ring: Vec<(vk::Image, vk::DeviceMemory)>,
+    /// (image, memory, exported dmabuf) — the dmabuf is built once and
+    /// cloned per frame, keeping a stable identity so the target renderer's
+    /// texture cache (WeakDmabuf-keyed) hits instead of re-importing an
+    /// egl image every frame.
+    dst_ring: Vec<(vk::Image, vk::DeviceMemory, Dmabuf)>,
     dst_index: usize,
     mem_type_cache: std::collections::HashMap<u32, u32>,
 }
@@ -141,7 +145,7 @@ impl Drop for BridgeCore {
             if let Some(cmd) = state.cmd.take() {
                 self.device.free_command_buffers(self.cmd_pool, &[cmd]);
             }
-            for (img, mem) in state.dst_ring.drain(..) {
+            for (img, mem, _) in state.dst_ring.drain(..) {
                 self.device.destroy_image(img, None);
                 self.device.free_memory(mem, None);
             }
@@ -286,13 +290,13 @@ impl BridgeCore {
 
         // -- destination image: reuse a ring slot (created on demand)
         const DST_RING_SIZE: usize = 3;
-        let (dst, dst_mem) = {
+        let (dst, _dst_mem, dmabuf) = {
             // never call into the driver while holding the state lock:
             // mem_type() locks the same mutex and would self-deadlock
             {
                 let mut state = self.state.lock().unwrap();
                 if state.dst_key != Some((vk_format, w, h)) {
-                    for (img, mem) in state.dst_ring.drain(..) {
+                    for (img, mem, _) in state.dst_ring.drain(..) {
                         unsafe {
                             self.device.destroy_image(img, None);
                             self.device.free_memory(mem, None);
@@ -308,9 +312,9 @@ impl BridgeCore {
                 state.dst_index = (idx + 1) % DST_RING_SIZE;
                 idx
             };
-            let existing = { self.state.lock().unwrap().dst_ring.get(idx).copied() };
-            if let Some((img, mem)) = existing {
-                (img, mem)
+            let existing = { self.state.lock().unwrap().dst_ring.get(idx).cloned() };
+            if let Some(slot) = existing {
+                slot
             } else {
                 let mut external_memory_info = vk::ExternalMemoryImageCreateInfo::default()
                     .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
@@ -341,14 +345,38 @@ impl BridgeCore {
                     .memory_type_index(mem_type);
                 let mem = unsafe { self.device.allocate_memory(&alloc, None)? };
                 unsafe { self.device.bind_image_memory(img, mem, 0)? };
-                self.state.lock().unwrap().dst_ring.push((img, mem));
-                (img, mem)
+
+                // export + build the dmabuf once; clones keep a stable identity
+                let fd = unsafe {
+                    self.get_memory_fd.get_memory_fd(
+                        &vk::MemoryGetFdInfoKHR::default()
+                            .memory(mem)
+                            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT),
+                    )?
+                };
+                let subresource =
+                    vk::ImageSubresource::default().aspect_mask(vk::ImageAspectFlags::COLOR);
+                let layout = unsafe { self.device.get_image_subresource_layout(img, subresource) };
+                let mut builder = Dmabuf::builder(
+                    src.size(),
+                    format,
+                    DrmModifier::Linear,
+                    DmabufFlags::empty(),
+                );
+                let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+                if !builder.add_plane(owned, 0, layout.offset as u32, layout.row_pitch as u32) {
+                    return Err(VkBridgeError::Export);
+                }
+                let dmabuf = builder.build().ok_or(VkBridgeError::Export)?;
+
+                self.state.lock().unwrap().dst_ring.push((img, mem, dmabuf.clone()));
+                (img, mem, dmabuf)
             }
         };
 
         let _ = vk_format; // layout is fully described by the drm modifier
         let src_img = self.ensure_src_image(src, vk_format)?;
-        self.copy_inner(src, src_img, dst, dst_mem, regions)
+        self.copy_inner(src, src_img, dst, dmabuf, regions)
     }
 
     fn copy_inner(
@@ -356,12 +384,10 @@ impl BridgeCore {
         src: &Dmabuf,
         src_img: vk::Image,
         dst: vk::Image,
-        dst_mem: vk::DeviceMemory,
+        dmabuf: Dmabuf,
         regions: &[crate::utils::Rectangle<i32, crate::utils::Buffer>],
     ) -> Result<Dmabuf, VkBridgeError> {
         let (w, h) = (src.size().w as u32, src.size().h as u32);
-        let format = src.format().code;
-        let flags = DmabufFlags::empty();
 
         // record and submit the copy (reusing the pooled command buffer)
         let cmd = {
@@ -480,29 +506,8 @@ impl BridgeCore {
 
         submit_result?;
 
-        // export dst as dmabuf
-        let fd = unsafe {
-            self.get_memory_fd.get_memory_fd(
-                &vk::MemoryGetFdInfoKHR::default()
-                    .memory(dst_mem)
-                    .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT),
-            )
-        }?;
-        let subresource = vk::ImageSubresource::default().aspect_mask(vk::ImageAspectFlags::COLOR);
-        let layout = unsafe { self.device.get_image_subresource_layout(dst, subresource) };
-        // the ring keeps the image and memory alive across frames
-
-        let mut builder = Dmabuf::builder(
-            src.size(),
-            format,
-            DrmModifier::Linear,
-            flags,
-        );
-        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-        if !builder.add_plane(owned, 0, layout.offset as u32, layout.row_pitch as u32) {
-            return Err(VkBridgeError::Export);
-        }
-        let dmabuf = builder.build().ok_or(VkBridgeError::Export)?;
+        // the slot's dmabuf was built once at creation; cloning keeps a
+        // stable identity so the target renderer's texture cache hits
         Ok(dmabuf)
     }
 
