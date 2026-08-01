@@ -187,6 +187,8 @@ Only switch a surface's preferred device after >60-70% of it is on the other out
 
 ## 6. Probe Sources
 
+All in `docs/probes/` alongside this document.
+
 | File | What it proves |
 |---|---|
 | `xb30_probe.c` | Modifier import/export matrix across both GPUs (EGL/GBM) |
