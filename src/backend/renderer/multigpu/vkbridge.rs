@@ -226,7 +226,17 @@ struct CopyJob {
 pub struct VkBridge {
     core: std::sync::Arc<BridgeCore>,
     sender: std::sync::mpsc::SyncSender<CopyJob>,
-    latest: std::sync::Arc<std::sync::Mutex<Option<Dmabuf>>>,
+    latest: std::sync::Arc<std::sync::Mutex<Option<(usize, Dmabuf)>>>,
+    /// Sequence counter for completed copies (consumers only present a copy
+    /// once — re-presenting a stale copy caused ghost frames when content
+    /// disappeared faster than new copies arrived).
+    copy_seq: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    last_presented: std::sync::atomic::AtomicUsize,
+    /// Optional callback invoked whenever a copy completes; the compositor's
+    /// event loop uses it to schedule a present for the completed frame
+    /// (without it, completed copies wait for unrelated damage to be shown).
+    completion_notifier:
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>>,
     /// Number of submitted copy jobs (shared with the worker's completed
     /// counter). Used to keep the compositor from rendering into the staging
     /// buffer while the worker is still copying it.
@@ -576,8 +586,10 @@ impl BridgeCore {
 fn worker_main(
     core: std::sync::Arc<BridgeCore>,
     receiver: std::sync::mpsc::Receiver<CopyJob>,
-    latest: std::sync::Arc<std::sync::Mutex<Option<Dmabuf>>>,
+    latest: std::sync::Arc<std::sync::Mutex<Option<(usize, Dmabuf)>>>,
+    copy_seq: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     completed: std::sync::Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
+    notifier: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>>,
 ) {
     debug!("vkbridge: copy worker started");
     while let Ok(job) = receiver.recv() {
@@ -605,7 +617,14 @@ fn worker_main(
         }
         match core.copy_to_linear_blocking(&job.src, &job.dst, &job.regions) {
             Ok(()) => {
-                *latest.lock().unwrap() = Some(job.dst.clone());
+                let seq = copy_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                *latest.lock().unwrap() = Some((seq, job.dst.clone()));
+                if let Some(f) = notifier.lock().unwrap().as_ref() {
+                    debug!("vkbridge worker: calling completion notifier");
+                    f();
+                } else {
+                    debug!("vkbridge worker: notifier still None at copy completion");
+                }
             }
             Err(err) => warn!("vkbridge: copy failed: {err}"),
         }
@@ -730,21 +749,33 @@ impl VkBridge {
         });
         let (sender, receiver) = std::sync::mpsc::sync_channel::<CopyJob>(2);
         let latest = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let copy_seq = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let submitted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let completed = std::sync::Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new()));
+        let completion_notifier =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let worker_notifier = completion_notifier.clone();
         let worker = {
             let core = core.clone();
             let latest = latest.clone();
+            let copy_seq = copy_seq.clone();
             let completed = completed.clone();
             std::thread::Builder::new()
                 .name("vkbridge-copy".into())
-                .spawn(move || worker_main(core, receiver, latest, completed))
+                .spawn(move || {
+                    worker_main(core, receiver, latest, copy_seq, completed, worker_notifier)
+                })
                 .map_err(|err| VkBridgeError::Setup(format!("failed to spawn copy worker: {err}")))?
         };
         Ok(VkBridge {
             core,
             sender,
             latest,
+            copy_seq,
+            last_presented: std::sync::atomic::AtomicUsize::new(0),
+            // share the SAME Arc the worker holds, so set_completion_notifier
+            // updates reach the worker (a fresh Arc here would never propagate)
+            completion_notifier,
             submitted,
             completed,
             worker: Some(worker),
@@ -786,9 +817,35 @@ impl VkBridge {
         }
     }
 
-    /// The most recent completed linear dmabuf, if any.
-    pub fn latest_completed(&self) -> Option<Dmabuf> {
+    /// The most recent completed copy as (sequence, dmabuf).
+    pub fn latest_completed(&self) -> Option<(usize, Dmabuf)> {
         self.latest.lock().unwrap().clone()
+    }
+
+    /// The latest completed copy only if it is newer than `last_seq`
+    /// (used to present each copy exactly once).
+    pub fn completed_newer_than(&self, last_seq: usize) -> Option<(usize, Dmabuf)> {
+        self.latest
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|(seq, _)| *seq > last_seq)
+    }
+
+    /// Set the callback invoked whenever a copy completes.
+    pub fn set_completion_notifier(&self, f: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        *self.completion_notifier.lock().unwrap() = Some(f);
+    }
+
+    /// The sequence of the last completed copy that was presented.
+    pub fn last_presented_seq(&self) -> usize {
+        self.last_presented.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Record that a completed copy has been presented.
+    pub fn mark_presented(&self, seq: usize) {
+        self.last_presented
+            .store(seq, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

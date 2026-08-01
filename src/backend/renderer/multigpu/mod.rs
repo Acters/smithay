@@ -81,6 +81,16 @@ use wayland_server::protocol::{wl_buffer, wl_shm, wl_surface::WlSurface};
 pub mod gbm;
 pub mod vkbridge;
 
+/// Callback invoked when a bridge copy completes.
+#[derive(Clone)]
+pub struct CompletionNotifier(pub std::sync::Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for CompletionNotifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CompletionNotifier(..)")
+    }
+}
+
 /// Tracks available gpus from a given [`GraphicsApi`]
 #[derive(Debug)]
 pub struct GpuManager<A: GraphicsApi> {
@@ -93,6 +103,9 @@ pub struct GpuManager<A: GraphicsApi> {
     /// LINEAR, written by the bridge's vulkan copy, and presented directly.
     bridge_dst_rings: HashMap<(DrmNode, DrmNode), (Vec<Dmabuf>, usize)>,
     bridge: BridgeState,
+    /// Channel notified whenever a bridge copy completes; the compositor
+    /// event loop uses it to schedule presents for completed frames.
+    completion_notifier: Option<CompletionNotifier>,
     span: tracing::Span,
 }
 
@@ -225,6 +238,31 @@ impl<A: GraphicsApi> AsMut<A> for GpuManager<A> {
 }
 
 impl<A: GraphicsApi> GpuManager<A> {
+    /// Set the callback invoked whenever a bridge copy completes; the
+    /// compositor's event loop uses it to schedule presents for completed
+    /// frames (without it, completed copies wait for unrelated damage).
+    pub fn set_completion_notifier(&mut self, f: impl Fn() + Send + Sync + 'static) {
+        let f = std::sync::Arc::new(f);
+        self.completion_notifier = Some(CompletionNotifier(f.clone()));
+        if let BridgeState::Ready(bridge) = &mut self.bridge {
+            bridge.set_completion_notifier(f);
+        }
+    }
+
+    /// Returns true if a completed bridge copy is newer than the last one
+    /// presented (i.e. there is a completed frame waiting to be shown on a
+    /// foreign output). Used by the completion notification to decide whether
+    /// a redraw is actually needed.
+    pub fn bridge_pending_completed(&self) -> bool {
+        match &self.bridge {
+            BridgeState::Ready(bridge) => {
+                let latest = bridge.latest_completed().map(|(seq, _)| seq).unwrap_or(0);
+                latest > bridge.last_presented_seq()
+            }
+            _ => false,
+        }
+    }
+
     /// Create a new [`GpuManager`] for a given [`GraphicsApi`].
     pub fn new(api: A) -> Result<GpuManager<A>, Error<A, A>> {
         let span = info_span!("renderer_multi", backend = A::identifier());
@@ -238,6 +276,7 @@ impl<A: GraphicsApi> GpuManager<A> {
             dmabuf_cache: HashMap::new(),
             bridge_dst_rings: HashMap::new(),
             bridge: BridgeState::NotTried,
+            completion_notifier: None,
             span,
         })
     }
@@ -351,6 +390,7 @@ impl<A: GraphicsApi> GpuManager<A> {
                         .bridge_dst_rings
                         .entry((*render_device, *target_device))
                         .or_default(),
+                    completion_notifier: self.completion_notifier.clone().map(|n| n.0),
                 }),
                 other_renderers: others,
                 span: tracing::Span::current(),
@@ -451,6 +491,7 @@ impl<A: GraphicsApi> GpuManager<A> {
                         .bridge_dst_rings
                         .entry((*render_device, *target_device))
                         .or_default(),
+                    completion_notifier: render_api.completion_notifier.clone().map(|n| n.0),
                 }),
                 other_renderers: others,
                 span: tracing::Span::current(),
@@ -951,7 +992,10 @@ struct TargetData<'target, T: GraphicsApi> {
     format: Fourcc,
     bridge: &'target mut BridgeState,
     bridge_dsts: &'target mut (Vec<Dmabuf>, usize),
+    completion_notifier: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
+
+// (TargetData holds the raw callback Arc)' 
 
 struct TargetFrameData<'target, 'frame, 'buffer, T: GraphicsApi> {
     device: &'frame mut &'target mut T::Device,
@@ -1317,6 +1361,12 @@ where
                 BridgeState::Initializing(rx) => match rx.try_recv() {
                     Ok(Ok(bridge)) => {
                         info!("vkbridge: init completed");
+                        if let Some(tx) = &target.completion_notifier {
+                            debug!("vkbridge: completion notifier set on bridge");
+                            bridge.set_completion_notifier(tx.clone());
+                        } else {
+                            warn!("vkbridge: NO completion notifier available at Ready transition");
+                        }
                         Some(BridgeState::Ready(bridge))
                     }
                     Ok(Err(err)) => {
@@ -1676,13 +1726,9 @@ where
                 // copy for every empty-damage present (observed: the internal
                 // panel presents empty frames at ~30fps while another output
                 // animates, costing a whole copy worker core for nothing)
-                if copy_rects.is_empty() {
-                    render
-                        .renderer_mut()
-                        .cleanup_texture_cache()
-                        .map_err(Error::Render)?;
-                    return Ok(sync::SyncPoint::signaled());
-                }
+                // NOTE: only the copy *submission* is skipped on empty damage;
+                // previously completed copies may still need presenting
+                // (e.g. after content disappeared), so presentation continues.
 
                 // v3 pipeline: submit this frame's staging buffer to the copy
                 // worker (never blocks the compositor) and consume the latest
@@ -1694,25 +1740,36 @@ where
                 // buffer we composite here is one frame old, so its valid
                 // regions would not cover this frame's damage, sampling
                 // uninitialized garbage (the "cycling glitched frame" bug).
-                if let Some(bridge) = target.bridge.as_mut() {
-                    if let (Some(staging), Some(dst)) = (target.dmabuf.clone(), target.bridge_dst.clone()) {
-                        bridge.submit_copy(staging, dst, sync.clone(), Vec::new());
+                if !copy_rects.is_empty() {
+                    if let Some(bridge) = target.bridge.as_mut() {
+                        if let (Some(staging), Some(dst)) = (target.dmabuf.clone(), target.bridge_dst.clone()) {
+                            bridge.submit_copy(staging, dst, sync.clone(), Vec::new());
+                        }
                     }
                 }
+                // only present each completed copy once; re-presenting a stale
+                // copy kept a ghost frame alive when content disappeared
                 let bridged_texture = target
                     .bridge
                     .as_mut()
-                    .and_then(|bridge| bridge.latest_completed())
-                    .and_then(|linear| {
-                        target
-                            .device
-                            .renderer_mut()
-                            .import_dmabuf(&linear, Some(&[Rectangle::from_size(buffer_size)]))
-                            .map_err(|err| {
-                                warn!("vulkan bridge: failed to import linear dmabuf on target: {err}");
-                                err
-                            })
-                            .ok()
+                    .and_then(|bridge| {
+                        bridge.completed_newer_than(bridge.last_presented_seq()).and_then(
+                            |(seq, linear)| {
+                                target
+                                    .device
+                                    .renderer_mut()
+                                    .import_dmabuf(&linear, Some(&[Rectangle::from_size(buffer_size)]))
+                                    .map_err(|err| {
+                                        warn!("vulkan bridge: failed to import dst on target: {err}");
+                                        err
+                                    })
+                                    .ok()
+                                    .map(|texture| {
+                                        bridge.mark_presented(seq);
+                                        texture
+                                    })
+                            },
+                        )
                     });
 
                 let textures = if let Some(texture) = bridged_texture {
