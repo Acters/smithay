@@ -114,6 +114,27 @@ Intel imports as EGLImage (TEXTURE_2D), blits to scanout surface
 7. **Caching**: src import image (staging is stable), pooled command buffer, memory-type queries, dst import cache (per fd), stable allocator-Dmabuf identities (WeakDmabuf texture-cache hits on the target side).
 8. **Empty-damage gate**: no copy submission for empty frames (upstream's skip), but presentation of completed copies continues.
 
+### GPU synchronization (final)
+
+The copy is fully GPU-synchronized (no CPU waits except the necessary completion-fence poll for race prevention):
+
+```
+NVIDIA GLES render into persistent staging (block-linear)
+    ↓ EGL native fence fd (SYNC_FD handle type, NOT OPAQUE_FD —
+       the earlier handle-type mismatch was the v2-wip bug)
+NVIDIA Vulkan imports the fence as a semaphore
+    ↓ copy waits GPU-side on it
+NVIDIA Vulkan copies staging → Intel-owned LINEAR BO
+    ↓ copy signals an exportable SYNC_FD semaphore
+Intel imports the completion fd as an EGLFence
+    ↓ glWaitSync (GPU-side wait, no CPU block)
+Intel blits to scanout surface
+```
+
+The worker polls the completion fence (kernel sleep until the GPU copy ACTUALLY finishes) before unblocking the compositor — previously the completion counter incremented at submission, letting the compositor re-render into staging while the copy was still in flight, tearing the bottom half of animated windows (black patches in vesktop). That race is fixed.
+
+Proven in `gles_fence_vk_bridge_poc.c`: full GPU-synced chain (GLES render → EGL fence → Vulkan wait → copy → completion fence → Intel wait → correct pixel), no CPU waits anywhere.
+
 ### Performance (dogfooded)
 
 - Internal panel: full 144 fps, 10-bit via dGPU, zero render errors.
