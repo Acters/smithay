@@ -256,7 +256,7 @@ impl<A: GraphicsApi> GpuManager<A> {
     pub fn bridge_pending_completed(&self) -> bool {
         match &self.bridge {
             BridgeState::Ready(bridge) => {
-                let latest = bridge.latest_completed().map(|(seq, _)| seq).unwrap_or(0);
+                let latest = bridge.latest_completed().map(|(seq, _, _)| seq).unwrap_or(0);
                 latest > bridge.last_presented_seq()
             }
             _ => false,
@@ -1749,12 +1749,12 @@ where
                 }
                 // only present each completed copy once; re-presenting a stale
                 // copy kept a ghost frame alive when content disappeared
-                let bridged_texture = target
+                let bridged = target
                     .bridge
                     .as_mut()
                     .and_then(|bridge| {
                         bridge.completed_newer_than(bridge.last_presented_seq()).and_then(
-                            |(seq, linear)| {
+                            |(seq, linear, completion_fd)| {
                                 target
                                     .device
                                     .renderer_mut()
@@ -1766,11 +1766,18 @@ where
                                     .ok()
                                     .map(|texture| {
                                         bridge.mark_presented(seq);
-                                        texture
+                                        (texture, completion_fd)
                                     })
                             },
                         )
                     });
+                let (bridged_texture, copy_sync) = match bridged {
+                    Some((texture, fd)) => (
+                        Some(texture),
+                        Some(sync::SyncPoint::from(vkbridge::NativeFdFence::new(fd))),
+                    ),
+                    None => (None, None),
+                };
 
                 let textures = if let Some(texture) = bridged_texture {
                     // The bridge copy lags one frame behind, so damage-limited
@@ -1829,6 +1836,10 @@ where
                     .renderer_mut()
                     .render(target.framebuffer, self.size, Transform::Normal)
                     .map_err(Error::Target)?;
+                if let Some(sp) = &copy_sync {
+                    // gpu-side wait for the bridge copy to finish before sampling
+                    frame.wait(sp).map_err(Error::Target)?;
+                }
                 for (texture, rect) in textures {
                     for damage_rect in damage.iter().filter_map(|dmg_rect| dmg_rect.intersection(rect)) {
                         let dst = damage_rect

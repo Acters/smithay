@@ -17,7 +17,7 @@
 //! (e.g. by blocking on the render [`crate::backend::renderer::sync::SyncPoint`]),
 //! and this bridge blocks (`vkQueueWaitIdle`) before returning the exported dmabuf.
 
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 
 use ash::{ext, khr, vk};
 use tracing::{debug, info, warn};
@@ -175,6 +175,7 @@ struct BridgeCore {
     queue_family: u32,
     cmd_pool: vk::CommandPool,
     get_memory_fd: khr::external_memory_fd::Device,
+    get_semaphore_fd: khr::external_semaphore_fd::Device,
     state: std::sync::Mutex<CopyState>,
 }
 
@@ -226,7 +227,7 @@ struct CopyJob {
 pub struct VkBridge {
     core: std::sync::Arc<BridgeCore>,
     sender: std::sync::mpsc::SyncSender<CopyJob>,
-    latest: std::sync::Arc<std::sync::Mutex<Option<(usize, Dmabuf)>>>,
+    latest: std::sync::Arc<std::sync::Mutex<Option<(usize, Dmabuf, std::os::fd::OwnedFd)>>>,
     /// Sequence counter for completed copies (consumers only present a copy
     /// once — re-presenting a stale copy caused ghost frames when content
     /// disappeared faster than new copies arrived).
@@ -412,6 +413,30 @@ impl BridgeCore {
         Ok(img)
     }
 
+    /// GPU-synchronized copy: the copy waits on the render fence (imported as
+    /// a SYNC_FD semaphore — the EGL native fence fd is a sync_file) on the GPU
+    /// timeline, and signals an exportable SYNC_FD semaphore on completion.
+    /// No CPU waits anywhere. Returns the completion semaphore's fd, which the
+    /// consumer imports as an EGLFence for a GPU-side wait before sampling.
+    fn copy_to_linear_synced(
+        &self,
+        src: &Dmabuf,
+        dst: &Dmabuf,
+        wait_fd: Option<std::os::fd::OwnedFd>,
+        regions: &[crate::utils::Rectangle<i32, crate::utils::Buffer>],
+    ) -> Result<std::os::fd::OwnedFd, VkBridgeError> {
+        if src.num_planes() != 1 {
+            return Err(VkBridgeError::Unsupported);
+        }
+        let format = src.format().code;
+        let vk_format = get_vk_format(format).ok_or(VkBridgeError::Unsupported)?;
+        let _ = (src.size(), format);
+
+        let src_img = self.ensure_src_image(src, vk_format)?;
+        let dst_img = self.ensure_dst_import(dst, vk_format)?;
+        self.copy_inner_synced(src, src_img, dst_img, wait_fd, regions)
+    }
+
     fn copy_to_linear_blocking(
         &self,
         src: &Dmabuf,
@@ -435,7 +460,70 @@ impl BridgeCore {
         let _ = vk_format; // layout is fully described by the drm modifier
         let src_img = self.ensure_src_image(src, vk_format)?;
         let dst_img = self.ensure_dst_import(dst, vk_format)?;
-        self.copy_inner(src, src_img, dst_img, regions)
+        self.copy_inner(src, src_img, dst_img, None, None, regions)
+    }
+
+    fn copy_inner_synced(
+        &self,
+        src: &Dmabuf,
+        src_img: vk::Image,
+        dst_img: vk::Image,
+        wait_fd: Option<std::os::fd::OwnedFd>,
+        regions: &[crate::utils::Rectangle<i32, crate::utils::Buffer>],
+    ) -> Result<std::os::fd::OwnedFd, VkBridgeError> {
+        // import the render fence as a SYNC_FD semaphore (GPU-side wait)
+        let wait_sem = match wait_fd {
+            Some(fd) => {
+                let sem = unsafe {
+                    self.device
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?
+                };
+                let import = vk::ImportSemaphoreFdInfoKHR::default()
+                    .semaphore(sem)
+                    .flags(vk::SemaphoreImportFlags::TEMPORARY)
+                    .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+                    .fd(fd.into_raw_fd());
+                unsafe { self.get_semaphore_fd.import_semaphore_fd(&import)? };
+                Some(sem)
+            }
+            None => None,
+        };
+
+        // exportable completion semaphore
+        let mut export_sem_info = vk::ExportSemaphoreCreateInfo::default()
+            .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        let completion_sem = unsafe {
+            self.device.create_semaphore(
+                &vk::SemaphoreCreateInfo::default().push_next(&mut export_sem_info),
+                None,
+            )?
+        };
+
+        let result = self.copy_inner(src, src_img, dst_img, wait_sem, Some(completion_sem), regions);
+
+        if let Some(sem) = wait_sem {
+            unsafe { self.device.destroy_semaphore(sem, None) };
+        }
+
+        match result {
+            Ok(()) => {
+                // export the completion semaphore's fd (a proper sync_file
+                // that signals when the copy finishes on the gpu timeline)
+                let fd = unsafe {
+                    self.get_semaphore_fd.get_semaphore_fd(
+                        &vk::SemaphoreGetFdInfoKHR::default()
+                            .semaphore(completion_sem)
+                            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
+                    )?
+                };
+                unsafe { self.device.destroy_semaphore(completion_sem, None) };
+                Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+            }
+            Err(err) => {
+                unsafe { self.device.destroy_semaphore(completion_sem, None) };
+                Err(err)
+            }
+        }
     }
 
     fn copy_inner(
@@ -443,6 +531,8 @@ impl BridgeCore {
         src: &Dmabuf,
         src_img: vk::Image,
         dst_img: vk::Image,
+        wait_sem: Option<vk::Semaphore>,
+        signal_sem: Option<vk::Semaphore>,
         regions: &[crate::utils::Rectangle<i32, crate::utils::Buffer>],
     ) -> Result<(), VkBridgeError> {
         let (w, h) = (src.size().w as u32, src.size().h as u32);
@@ -555,9 +645,22 @@ impl BridgeCore {
                 );
                 self.device.end_command_buffer(cmd)?;
                 let cmds = [cmd];
-                let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+                let wait_semaphores: Vec<vk::Semaphore> = wait_sem.into_iter().collect();
+                let signal_semaphores: Vec<vk::Semaphore> = signal_sem.into_iter().collect();
+                let wait_stages = [vk::PipelineStageFlags::TRANSFER];
+                let mut submit = vk::SubmitInfo::default().command_buffers(&cmds);
+                if !wait_semaphores.is_empty() {
+                    submit = submit
+                        .wait_semaphores(&wait_semaphores)
+                        .wait_dst_stage_mask(&wait_stages);
+                }
+                if !signal_semaphores.is_empty() {
+                    submit = submit.signal_semaphores(&signal_semaphores);
+                }
                 self.device.queue_submit(self.queue, &[submit], vk::Fence::null())?;
-                self.device.queue_wait_idle(self.queue)?;
+                if signal_sem.is_none() {
+                    self.device.queue_wait_idle(self.queue)?;
+                }
             }
             Ok(())
         })();
@@ -586,44 +689,35 @@ impl BridgeCore {
 fn worker_main(
     core: std::sync::Arc<BridgeCore>,
     receiver: std::sync::mpsc::Receiver<CopyJob>,
-    latest: std::sync::Arc<std::sync::Mutex<Option<(usize, Dmabuf)>>>,
+    latest: std::sync::Arc<std::sync::Mutex<Option<(usize, Dmabuf, std::os::fd::OwnedFd)>>>,
     copy_seq: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     completed: std::sync::Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
     notifier: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>>,
 ) {
-    debug!("vkbridge: copy worker started");
+    debug!("vkbridge: copy worker started (GPU-synced)");
     while let Ok(job) = receiver.recv() {
-        match &job.wait_fd {
-            Some(fd) => {
-                // poll the exported fence fd: sleeps in the kernel, unlike
-                // the nvidia EGL client wait which spins
+        // the copy waits on the render fence on the GPU timeline (imported as
+        // a SYNC_FD semaphore) and signals a completion semaphore on finish —
+        // no CPU waits anywhere
+        match core.copy_to_linear_synced(&job.src, &job.dst, job.wait_fd, &job.regions) {
+            Ok(completion_fd) => {
+                // wait for the copy to ACTUALLY finish on the gpu timeline
+                // (the completion semaphore signals) before unblocking the
+                // compositor — otherwise it re-renders into the staging buffer
+                // while the copy is still in flight, tearing the bottom half
                 let mut pfd = libc::pollfd {
-                    fd: fd.as_raw_fd(),
+                    fd: std::os::fd::AsRawFd::as_raw_fd(&completion_fd),
                     events: libc::POLLIN,
                     revents: 0,
                 };
-                let ret = unsafe { libc::poll(&mut pfd, 1, 500) };
-                if ret < 0 {
-                    warn!("vkbridge: fence poll failed: {}", std::io::Error::last_os_error());
+                if unsafe { libc::poll(&mut pfd, 1, 500) } < 0 {
+                    warn!("vkbridge: completion fence poll failed: {}", std::io::Error::last_os_error());
                     continue;
                 }
-            }
-            None => {
-                if let Err(err) = job.sync.wait() {
-                    warn!("vkbridge: render sync interrupted: {err:?}");
-                    continue;
-                }
-            }
-        }
-        match core.copy_to_linear_blocking(&job.src, &job.dst, &job.regions) {
-            Ok(()) => {
                 let seq = copy_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                *latest.lock().unwrap() = Some((seq, job.dst.clone()));
+                *latest.lock().unwrap() = Some((seq, job.dst.clone(), completion_fd));
                 if let Some(f) = notifier.lock().unwrap().as_ref() {
-                    debug!("vkbridge worker: calling completion notifier");
                     f();
-                } else {
-                    debug!("vkbridge worker: notifier still None at copy completion");
                 }
             }
             Err(err) => warn!("vkbridge: copy failed: {err}"),
@@ -712,6 +806,8 @@ impl VkBridge {
             ext::image_drm_format_modifier::NAME.as_ptr(),
             ext::external_memory_dma_buf::NAME.as_ptr(),
             khr::external_memory_fd::NAME.as_ptr(),
+            khr::external_semaphore::NAME.as_ptr(),
+            khr::external_semaphore_fd::NAME.as_ptr(),
         ];
         let device = unsafe {
             instance.create_device(
@@ -734,6 +830,7 @@ impl VkBridge {
         }?;
         info!("vkbridge: queue + cmd pool ok");
         let get_memory_fd = khr::external_memory_fd::Device::new(&instance, &device);
+        let get_semaphore_fd = khr::external_semaphore_fd::Device::new(&instance, &device);
 
         info!("vkbridge: initialized");
         let core = std::sync::Arc::new(BridgeCore {
@@ -745,6 +842,7 @@ impl VkBridge {
             queue_family,
             cmd_pool,
             get_memory_fd,
+            get_semaphore_fd,
             state: std::sync::Mutex::new(CopyState::default()),
         });
         let (sender, receiver) = std::sync::mpsc::sync_channel::<CopyJob>(2);
@@ -817,19 +915,32 @@ impl VkBridge {
         }
     }
 
-    /// The most recent completed copy as (sequence, dmabuf).
-    pub fn latest_completed(&self) -> Option<(usize, Dmabuf)> {
-        self.latest.lock().unwrap().clone()
+    /// The most recent completed copy as (sequence, dmabuf, dup of the
+    /// completion sync fd. The slot keeps the original fd until a newer copy
+    /// replaces it.
+    pub fn latest_completed(&self) -> Option<(usize, Dmabuf, std::os::fd::OwnedFd)> {
+        let slot = self.latest.lock().unwrap();
+        slot.as_ref().and_then(|(seq, dmabuf, fd)| {
+            let dup = unsafe { libc::dup(std::os::fd::AsRawFd::as_raw_fd(fd)) };
+            (dup >= 0).then(|| (*seq, dmabuf.clone(), unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) }))
+        })
     }
 
     /// The latest completed copy only if it is newer than `last_seq`
     /// (used to present each copy exactly once).
-    pub fn completed_newer_than(&self, last_seq: usize) -> Option<(usize, Dmabuf)> {
-        self.latest
-            .lock()
-            .unwrap()
-            .clone()
-            .filter(|(seq, _)| *seq > last_seq)
+    pub fn completed_newer_than(
+        &self,
+        last_seq: usize,
+    ) -> Option<(usize, Dmabuf, std::os::fd::OwnedFd)> {
+        let slot = self.latest.lock().unwrap();
+        slot.as_ref().and_then(|(seq, dmabuf, fd)| {
+            if *seq > last_seq {
+                let dup = unsafe { libc::dup(std::os::fd::AsRawFd::as_raw_fd(fd)) };
+                (dup >= 0).then(|| (*seq, dmabuf.clone(), unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) }))
+            } else {
+                None
+            }
+        })
     }
 
     /// Set the callback invoked whenever a copy completes.
@@ -863,5 +974,51 @@ impl Drop for VkBridge {
 impl std::fmt::Debug for VkBridge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VkBridge").finish_non_exhaustive()
+    }
+}
+
+/// A native fence fd wrapped as a smithay [`Fence`](crate::backend::renderer::sync::Fence),
+/// letting consumers wait on a vulkan-produced fence through the usual
+/// [`SyncPoint`](crate::backend::renderer::sync::SyncPoint) paths (including
+/// server-side waits after EGL import).
+#[derive(Debug)]
+pub struct NativeFdFence(std::os::fd::OwnedFd);
+
+impl NativeFdFence {
+    /// Wrap an owned native fence fd.
+    pub fn new(fd: std::os::fd::OwnedFd) -> Self {
+        Self(fd)
+    }
+}
+
+impl crate::backend::renderer::sync::Fence for NativeFdFence {
+    fn is_signaled(&self) -> bool {
+        let mut pfd = libc::pollfd {
+            fd: std::os::fd::AsRawFd::as_raw_fd(&self.0),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        unsafe { libc::poll(&mut pfd, 1, 0) > 0 }
+    }
+
+    fn wait(&self) -> Result<(), crate::backend::renderer::sync::Interrupted> {
+        let mut pfd = libc::pollfd {
+            fd: std::os::fd::AsRawFd::as_raw_fd(&self.0),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pfd, 1, -1) } < 0 {
+            return Err(crate::backend::renderer::sync::Interrupted);
+        }
+        Ok(())
+    }
+
+    fn is_exportable(&self) -> bool {
+        true
+    }
+
+    fn export(&self) -> Option<std::os::fd::OwnedFd> {
+        let fd = unsafe { libc::dup(std::os::fd::AsRawFd::as_raw_fd(&self.0)) };
+        (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
     }
 }
