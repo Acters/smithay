@@ -42,7 +42,17 @@ use crate::backend::{
 // possible in main(); the multigpu renderer picks the result up later.
 // ---------------------------------------------------------------------------
 
-type InitResult = Result<VkBridge, VkBridgeError>;
+/// Early-stage vulkan objects created before the compositor acquires DRM
+/// master. Only the *instance* may be created pre-master: vkCreateInstance
+/// deadlocks the proprietary NVIDIA ICD once master is held, and a full
+/// device created this early breaks direct scanout on the NVIDIA output.
+struct Preinit {
+    entry: ash::Entry,
+    instance: ash::Instance,
+    phd: vk::PhysicalDevice,
+}
+
+type InitResult = Result<Preinit, VkBridgeError>;
 static PREINIT: std::sync::Mutex<Option<std::sync::mpsc::Receiver<InitResult>>> =
     std::sync::Mutex::new(None);
 
@@ -58,10 +68,50 @@ pub fn preinit(vendor_id: Option<u32>) {
     std::thread::Builder::new()
         .name("vkbridge-init".into())
         .spawn(move || {
-            let _ = tx.send(VkBridge::new_for_vendor(vendor_id));
+            let _ = tx.send(early_init(vendor_id));
         })
         .expect("failed to spawn vkbridge init thread");
     *guard = Some(rx);
+}
+
+/// The pre-master stage: loader, instance, physical device selection only.
+fn early_init(vendor_id: Option<u32>) -> Result<Preinit, VkBridgeError> {
+    info!("vkbridge: early init start");
+    let entry = unsafe { ash::Entry::load() }
+        .map_err(|err| VkBridgeError::Setup(format!("failed to load vulkan: {err}")))?;
+    let app_info = vk::ApplicationInfo::default()
+        .application_name(c"smithay-vkbridge")
+        .api_version(vk::API_VERSION_1_3);
+    let instance = unsafe {
+        entry.create_instance(
+            &vk::InstanceCreateInfo::default().application_info(&app_info),
+            None,
+        )
+    }?;
+    info!("vkbridge: early instance created");
+
+    let phds = unsafe { instance.enumerate_physical_devices()? };
+    let mut phd = None;
+    let mut fallback = None;
+    for candidate in phds {
+        let props = unsafe { instance.get_physical_device_properties(candidate) };
+        let vendor = props.vendor_id;
+        debug!("vkbridge: phd vendor=0x{vendor:04x}");
+        let matches = match vendor_id {
+            Some(want) => vendor == want,
+            None => vendor != 0x8086,
+        };
+        if matches {
+            phd = Some(candidate);
+            break;
+        }
+        if fallback.is_none() {
+            fallback = Some(candidate);
+        }
+    }
+    let phd = phd.or(fallback).ok_or_else(|| VkBridgeError::Setup("no physical device".into()))?;
+    info!("vkbridge: early init done (device creation deferred)");
+    Ok(Preinit { entry, instance, phd })
 }
 
 /// Take the pre-initialization receiver, if [`preinit`] was called.
@@ -594,53 +644,38 @@ impl VkBridge {
 
     fn init_with(matcher: impl Fn(u32, i64, i64) -> bool) -> Result<Self, VkBridgeError> {
         info!("vkbridge: init start");
-        let entry = unsafe { ash::Entry::load() }
-            .map_err(|err| VkBridgeError::Setup(format!("failed to load vulkan: {err}")))?;
-        info!("vkbridge: loader ok");
+        // Prefer the pre-master Preinit (instance already exists); fall back to
+        // creating everything inline for non-preinit flows.
+        let (entry, instance, phd) = match take_preinit() {
+            Some(rx) => match rx.recv() {
+                Ok(Ok(pre)) => {
+                    info!("vkbridge: using pre-master instance");
+                    (pre.entry, pre.instance, pre.phd)
+                }
+                Ok(Err(err)) => return Err(err),
+                Err(_) => return Err(VkBridgeError::Setup("preinit channel closed".into())),
+            },
+            None => {
+                let pre = early_init(None)?;
+                (pre.entry, pre.instance, pre.phd)
+            }
+        };
 
-        let app_info = vk::ApplicationInfo::default()
-            .application_name(c"smithay-vkbridge")
-            .api_version(vk::API_VERSION_1_3);
-        // NOTE: VK_EXT_physical_device_drm is intentionally *not* enabled here.
-        // The proprietary NVIDIA driver does not advertise it as an instance
-        // extension (instance creation fails with ERROR_EXTENSION_NOT_PRESENT),
-        // yet it fills in VkPhysicalDeviceDrmPropertiesEXT just fine without it.
-        let instance = unsafe {
-            entry.create_instance(
-                &vk::InstanceCreateInfo::default().application_info(&app_info),
-                None,
-            )
-        }?;
-        info!("vkbridge: instance created");
-
-        let phds = unsafe { instance.enumerate_physical_devices()? };
-        info!("vkbridge: enumerated {} physical devices", phds.len());
-        let mut phd = None;
-        for candidate in phds {
-            let (has_render, render_major, render_minor, vendor_id) = {
-                let mut drm_props = vk::PhysicalDeviceDrmPropertiesEXT::default();
-                let vendor_id = {
-                    let mut props =
-                        vk::PhysicalDeviceProperties2::default().push_next(&mut drm_props);
-                    unsafe { instance.get_physical_device_properties2(candidate, &mut props) };
-                    props.properties.vendor_id
-                };
-                (
-                    drm_props.has_render,
-                    drm_props.render_major,
-                    drm_props.render_minor,
-                    vendor_id,
-                )
-            };
-            debug!(
-                "vkbridge: phd vendor=0x{vendor_id:04x} render={render_major}:{render_minor}",
-            );
-            if has_render == vk::TRUE && matcher(vendor_id, render_major, render_minor) {
-                phd = Some(candidate);
-                break;
+        // device selection validation against the matcher (when a node is given)
+        {
+            let mut drm_props = vk::PhysicalDeviceDrmPropertiesEXT::default();
+            let mut props =
+                vk::PhysicalDeviceProperties2::default().push_next(&mut drm_props);
+            unsafe { instance.get_physical_device_properties2(phd, &mut props) };
+            let vendor_id = props.properties.vendor_id;
+            if drm_props.has_render == vk::TRUE
+                && !matcher(vendor_id, drm_props.render_major, drm_props.render_minor)
+            {
+                return Err(VkBridgeError::Setup(
+                    "preinited physical device does not match render node".into(),
+                ));
             }
         }
-        let phd = phd.ok_or_else(|| VkBridgeError::Setup("no matching physical device".into()))?;
 
         let queue_families = unsafe { instance.get_physical_device_queue_family_properties(phd) };
         let queue_family = queue_families

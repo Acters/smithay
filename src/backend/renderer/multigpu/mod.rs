@@ -1266,18 +1266,14 @@ where
                         }
 
                         if matches!(*target.bridge, BridgeState::NotTried) {
-                            *target.bridge = if let Some(rx) = vkbridge::take_preinit() {
-                                info!("vkbridge: using pre-initialized bridge receiver");
-                                BridgeState::Initializing(rx)
-                            } else {
-                                let node = *self.render.node();
-                                let (tx, rx) = std::sync::mpsc::channel();
-                                info!("vkbridge: spawning init thread");
-                                std::thread::spawn(move || {
-                                    let _ = tx.send(vkbridge::VkBridge::new(node));
-                                });
-                                BridgeState::Initializing(rx)
-                            };
+                            // the preinit instance is consumed inside VkBridge::new
+                            let node = *self.render.node();
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            info!("vkbridge: spawning init thread");
+                            std::thread::spawn(move || {
+                                let _ = tx.send(vkbridge::VkBridge::new(node));
+                            });
+                            *target.bridge = BridgeState::Initializing(rx);
                         }
 
                         *target.cached_buffer = Some((false, dmabuf));
@@ -1632,6 +1628,19 @@ where
                     });
                 if copy_rects.len() > MAX_CPU_COPIES {
                     copy_rects = Vec::from([Rectangle::from_size(buffer_size)]);
+                }
+
+                // no damage at all: upstream skips the copy entirely here, and
+                // so must the bridge — otherwise we burn a full-frame vulkan
+                // copy for every empty-damage present (observed: the internal
+                // panel presents empty frames at ~30fps while another output
+                // animates, costing a whole copy worker core for nothing)
+                if copy_rects.is_empty() {
+                    render
+                        .renderer_mut()
+                        .cleanup_texture_cache()
+                        .map_err(Error::Render)?;
+                    return Ok(sync::SyncPoint::signaled());
                 }
 
                 // v3 pipeline: submit this frame's staging buffer to the copy
