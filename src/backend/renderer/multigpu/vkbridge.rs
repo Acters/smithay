@@ -17,10 +17,9 @@
 //! (e.g. by blocking on the render [`crate::backend::renderer::sync::SyncPoint`]),
 //! and this bridge blocks (`vkQueueWaitIdle`) before returning the exported dmabuf.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd};
 
 use ash::{ext, khr, vk};
-use drm_fourcc::DrmModifier;
 use tracing::{debug, info, warn};
 
 use crate::backend::{
@@ -157,16 +156,11 @@ struct CopyState {
     /// (fd, modifier, format, w, h) of the currently imported source
     src_key: Option<(i32, u64, vk::Format, u32, u32)>,
     src_image: Option<(vk::Image, vk::DeviceMemory)>,
-    /// Reusable destination (linear, exportable) images. Ring of 3: the
-    /// consumer on the target gpu is at most ~2 frames behind, so reuse is
-    /// safe. Avoids per-frame create/alloc/free churn in the nvidia driver.
-    dst_key: Option<(vk::Format, u32, u32)>,
-    /// (image, memory, exported dmabuf) — the dmabuf is built once and
-    /// cloned per frame, keeping a stable identity so the target renderer's
-    /// texture cache (WeakDmabuf-keyed) hits instead of re-importing an
-    /// egl image every frame.
-    dst_ring: Vec<(vk::Image, vk::DeviceMemory, Dmabuf)>,
-    dst_index: usize,
+    /// Imported destination images, keyed by dmabuf fd. The destination
+    /// buffers are owned by the TARGET gpu's allocator (Intel GBM), imported
+    /// here for the vulkan copy. Imported once and reused — the import is
+    /// expensive (driver lock traffic).
+    dst_imports: std::collections::HashMap<i32, (vk::Image, vk::DeviceMemory)>,
     mem_type_cache: std::collections::HashMap<u32, u32>,
 }
 
@@ -195,7 +189,7 @@ impl Drop for BridgeCore {
             if let Some(cmd) = state.cmd.take() {
                 self.device.free_command_buffers(self.cmd_pool, &[cmd]);
             }
-            for (img, mem, _) in state.dst_ring.drain(..) {
+            for (_, (img, mem)) in state.dst_imports.drain() {
                 self.device.destroy_image(img, None);
                 self.device.free_memory(mem, None);
             }
@@ -209,6 +203,10 @@ impl Drop for BridgeCore {
 
 struct CopyJob {
     src: Dmabuf,
+    /// The target-gpu-owned destination buffer (allocated by the target
+    /// device's allocator). The worker publishes this same dmabuf on
+    /// completion — no export step from the render gpu needed.
+    dst: Dmabuf,
     sync: crate::backend::renderer::sync::SyncPoint,
     /// Exported native fence fd for the render sync point. The worker polls
     /// it instead of calling into EGL's client wait, which spins a cpu core
@@ -319,11 +317,97 @@ impl BridgeCore {
         Ok(img)
     }
 
+    /// Import (or reuse the cached import of) a target-owned destination
+    /// dmabuf as a vulkan TRANSFER_DST image. The buffer is allocated by the
+    /// target gpu's allocator (Intel GBM, system RAM) — no export step from
+    /// this gpu is needed at all.
+    fn ensure_dst_import(&self, dst: &Dmabuf, vk_format: vk::Format) -> Result<vk::Image, VkBridgeError> {
+        let (w, h) = (dst.size().w as u32, dst.size().h as u32);
+        let modifier = dst.format().modifier;
+        let fd = dst.handles().next().ok_or(VkBridgeError::Unsupported)?.as_raw_fd();
+
+        {
+            let state = self.state.lock().unwrap();
+            if let Some((img, _)) = state.dst_imports.get(&fd) {
+                return Ok(*img);
+            }
+        }
+
+        let stride = dst.strides().next().ok_or(VkBridgeError::Unsupported)?;
+        let offset = dst.offsets().next().ok_or(VkBridgeError::Unsupported)?;
+        let plane_layout = vk::SubresourceLayout {
+            offset: offset as u64,
+            size: 0,
+            row_pitch: stride as u64,
+            array_pitch: 0,
+            depth_pitch: 0,
+        };
+        let mut mod_create = vk::ImageDrmFormatModifierExplicitCreateInfoEXT {
+            drm_format_modifier: modifier.into(),
+            drm_format_modifier_plane_count: 1,
+            p_plane_layouts: &plane_layout,
+            ..Default::default()
+        };
+        let mut ext_create = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let info = vk::ImageCreateInfo::default()
+            .push_next(&mut mod_create)
+            .push_next(&mut ext_create)
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk_format)
+            .extent(vk::Extent3D { width: w, height: h, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let img = unsafe { self.device.create_image(&info, None)? };
+
+        let req = unsafe { self.device.get_image_memory_requirements(img) };
+        let dup_fd = unsafe { libc::dup(fd) };
+        if dup_fd < 0 {
+            unsafe { self.device.destroy_image(img, None) };
+            return Err(VkBridgeError::Setup("failed to dup dst dmabuf fd".into()));
+        }
+        let mut import_info = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(dup_fd);
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(img);
+        let mem_type = self
+            .mem_type(req.memory_type_bits, vk::MemoryPropertyFlags::empty())
+            .ok_or(VkBridgeError::Setup("no memory type for dst import".into()))?;
+        let alloc = vk::MemoryAllocateInfo::default()
+            .push_next(&mut dedicated)
+            .push_next(&mut import_info)
+            .allocation_size(req.size)
+            .memory_type_index(mem_type);
+        let mem = match unsafe { self.device.allocate_memory(&alloc, None) } {
+            Ok(mem) => mem,
+            Err(err) => {
+                unsafe {
+                    libc::close(dup_fd);
+                    self.device.destroy_image(img, None);
+                }
+                return Err(err.into());
+            }
+        };
+        unsafe { self.device.bind_image_memory(img, mem, 0)? };
+
+        debug!("vkbridge: imported target-owned dst dmabuf fd={fd}");
+        self.state.lock().unwrap().dst_imports.insert(fd, (img, mem));
+        Ok(img)
+    }
+
     fn copy_to_linear_blocking(
         &self,
         src: &Dmabuf,
+        dst: &Dmabuf,
         regions: &[crate::utils::Rectangle<i32, crate::utils::Buffer>],
-    ) -> Result<Dmabuf, VkBridgeError> {
+    ) -> Result<(), VkBridgeError> {
         if src.num_planes() != 1 {
             return Err(VkBridgeError::Unsupported);
         }
@@ -338,105 +422,19 @@ impl BridgeCore {
         // the drm format modifier used for the import.
         let _ = (src_stride, src_offset);
 
-        // -- destination image: reuse a ring slot (created on demand)
-        const DST_RING_SIZE: usize = 3;
-        let (dst, _dst_mem, dmabuf) = {
-            // never call into the driver while holding the state lock:
-            // mem_type() locks the same mutex and would self-deadlock
-            {
-                let mut state = self.state.lock().unwrap();
-                if state.dst_key != Some((vk_format, w, h)) {
-                    for (img, mem, _) in state.dst_ring.drain(..) {
-                        unsafe {
-                            self.device.destroy_image(img, None);
-                            self.device.free_memory(mem, None);
-                        }
-                    }
-                    state.dst_key = Some((vk_format, w, h));
-                    state.dst_index = 0;
-                }
-            }
-            let idx = {
-                let mut state = self.state.lock().unwrap();
-                let idx = state.dst_index;
-                state.dst_index = (idx + 1) % DST_RING_SIZE;
-                idx
-            };
-            let existing = { self.state.lock().unwrap().dst_ring.get(idx).cloned() };
-            if let Some(slot) = existing {
-                slot
-            } else {
-                let mut external_memory_info = vk::ExternalMemoryImageCreateInfo::default()
-                    .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-                let info = vk::ImageCreateInfo::default()
-                    .push_next(&mut external_memory_info)
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .format(vk_format)
-                    .extent(vk::Extent3D { width: w, height: h, depth: 1 })
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .tiling(vk::ImageTiling::LINEAR)
-                    .usage(vk::ImageUsageFlags::TRANSFER_DST
-                        | vk::ImageUsageFlags::TRANSFER_SRC
-                        | vk::ImageUsageFlags::SAMPLED)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                    .initial_layout(vk::ImageLayout::UNDEFINED);
-                let img = unsafe { self.device.create_image(&info, None)? };
-                let req = unsafe { self.device.get_image_memory_requirements(img) };
-                let mut export_alloc = vk::ExportMemoryAllocateInfo::default()
-                    .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-                let mem_type = self
-                    .mem_type(req.memory_type_bits, vk::MemoryPropertyFlags::empty())
-                    .ok_or(VkBridgeError::Setup("no memory type for dst".into()))?;
-                let alloc = vk::MemoryAllocateInfo::default()
-                    .push_next(&mut export_alloc)
-                    .allocation_size(req.size)
-                    .memory_type_index(mem_type);
-                let mem = unsafe { self.device.allocate_memory(&alloc, None)? };
-                unsafe { self.device.bind_image_memory(img, mem, 0)? };
-
-                // export + build the dmabuf once; clones keep a stable identity
-                let fd = unsafe {
-                    self.get_memory_fd.get_memory_fd(
-                        &vk::MemoryGetFdInfoKHR::default()
-                            .memory(mem)
-                            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT),
-                    )?
-                };
-                let subresource =
-                    vk::ImageSubresource::default().aspect_mask(vk::ImageAspectFlags::COLOR);
-                let layout = unsafe { self.device.get_image_subresource_layout(img, subresource) };
-                let mut builder = Dmabuf::builder(
-                    src.size(),
-                    format,
-                    DrmModifier::Linear,
-                    DmabufFlags::empty(),
-                );
-                let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-                if !builder.add_plane(owned, 0, layout.offset as u32, layout.row_pitch as u32) {
-                    return Err(VkBridgeError::Export);
-                }
-                let dmabuf = builder.build().ok_or(VkBridgeError::Export)?;
-
-                self.state.lock().unwrap().dst_ring.push((img, mem, dmabuf.clone()));
-                (img, mem, dmabuf)
-            }
-        };
-
         let _ = vk_format; // layout is fully described by the drm modifier
         let src_img = self.ensure_src_image(src, vk_format)?;
-        self.copy_inner(src, src_img, dst, dmabuf, regions)
+        let dst_img = self.ensure_dst_import(dst, vk_format)?;
+        self.copy_inner(src, src_img, dst_img, regions)
     }
 
     fn copy_inner(
         &self,
         src: &Dmabuf,
         src_img: vk::Image,
-        dst: vk::Image,
-        dmabuf: Dmabuf,
+        dst_img: vk::Image,
         regions: &[crate::utils::Rectangle<i32, crate::utils::Buffer>],
-    ) -> Result<Dmabuf, VkBridgeError> {
+    ) -> Result<(), VkBridgeError> {
         let (w, h) = (src.size().w as u32, src.size().h as u32);
 
         // record and submit the copy (reusing the pooled command buffer)
@@ -491,7 +489,7 @@ impl BridgeCore {
                         .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                         .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
                         .dst_queue_family_index(self.queue_family)
-                        .image(dst)
+                        .image(dst_img)
                         .subresource_range(vk::ImageSubresourceRange {
                             aspect_mask: vk::ImageAspectFlags::COLOR,
                             base_mip_level: 0,
@@ -541,7 +539,7 @@ impl BridgeCore {
                     cmd,
                     src_img,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    dst,
+                    dst_img,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &copy_regions,
                 );
@@ -556,9 +554,7 @@ impl BridgeCore {
 
         submit_result?;
 
-        // the slot's dmabuf was built once at creation; cloning keeps a
-        // stable identity so the target renderer's texture cache hits
-        Ok(dmabuf)
+        Ok(())
     }
 
     fn mem_type(&self, bits: u32, required: vk::MemoryPropertyFlags) -> Option<u32> {
@@ -607,9 +603,9 @@ fn worker_main(
                 }
             }
         }
-        match core.copy_to_linear_blocking(&job.src, &job.regions) {
-            Ok(dmabuf) => {
-                *latest.lock().unwrap() = Some(dmabuf);
+        match core.copy_to_linear_blocking(&job.src, &job.dst, &job.regions) {
+            Ok(()) => {
+                *latest.lock().unwrap() = Some(job.dst.clone());
             }
             Err(err) => warn!("vkbridge: copy failed: {err}"),
         }
@@ -762,6 +758,7 @@ impl VkBridge {
     pub fn submit_copy(
         &self,
         src: Dmabuf,
+        dst: Dmabuf,
         sync: crate::backend::renderer::sync::SyncPoint,
         regions: Vec<crate::utils::Rectangle<i32, crate::utils::Buffer>>,
     ) {
@@ -769,7 +766,7 @@ impl VkBridge {
         self.submitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self
             .sender
-            .try_send(CopyJob { src, sync, wait_fd, regions })
+            .try_send(CopyJob { src, dst, sync, wait_fd, regions })
             .is_err()
         {
             debug!("vkbridge: copy queue full, skipping frame copy");

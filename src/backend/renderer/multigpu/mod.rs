@@ -87,6 +87,11 @@ pub struct GpuManager<A: GraphicsApi> {
     api: A,
     devices: Vec<A::Device>,
     dmabuf_cache: HashMap<(DrmNode, DrmNode), Option<(bool, Dmabuf)>>,
+    /// Target-gpu-owned destination buffers for the vulkan bridge, keyed by
+    /// (render node, target node). Each entry is (ring of buffers, rotation
+    /// index). Buffers are allocated from the TARGET device's allocator as
+    /// LINEAR, written by the bridge's vulkan copy, and presented directly.
+    bridge_dst_rings: HashMap<(DrmNode, DrmNode), (Vec<Dmabuf>, usize)>,
     bridge: BridgeState,
     span: tracing::Span,
 }
@@ -231,6 +236,7 @@ impl<A: GraphicsApi> GpuManager<A> {
             api,
             devices,
             dmabuf_cache: HashMap::new(),
+            bridge_dst_rings: HashMap::new(),
             bridge: BridgeState::NotTried,
             span,
         })
@@ -341,6 +347,10 @@ impl<A: GraphicsApi> GpuManager<A> {
                         .or_default(),
                     format: copy_format,
                     bridge: &mut self.bridge,
+                    bridge_dsts: self
+                        .bridge_dst_rings
+                        .entry((*render_device, *target_device))
+                        .or_default(),
                 }),
                 other_renderers: others,
                 span: tracing::Span::current(),
@@ -437,6 +447,10 @@ impl<A: GraphicsApi> GpuManager<A> {
                         .or_default(),
                     format: copy_format,
                     bridge: &mut render_api.bridge,
+                    bridge_dsts: render_api
+                        .bridge_dst_rings
+                        .entry((*render_device, *target_device))
+                        .or_default(),
                 }),
                 other_renderers: others,
                 span: tracing::Span::current(),
@@ -936,6 +950,7 @@ struct TargetData<'target, T: GraphicsApi> {
     cached_buffer: &'target mut Option<(bool, Dmabuf)>,
     format: Fourcc,
     bridge: &'target mut BridgeState,
+    bridge_dsts: &'target mut (Vec<Dmabuf>, usize),
 }
 
 struct TargetFrameData<'target, 'frame, 'buffer, T: GraphicsApi> {
@@ -946,6 +961,8 @@ struct TargetFrameData<'target, 'frame, 'buffer, T: GraphicsApi> {
     /// The staging buffer the frame is being rendered into on the render gpu
     /// (only needed by the vulkan bridge path).
     dmabuf: Option<Dmabuf>,
+    /// The target-gpu-owned destination buffer for this frame's bridge copy.
+    bridge_dst: Option<Dmabuf>,
     bridge: Option<&'frame mut vkbridge::VkBridge>,
 }
 
@@ -1218,6 +1235,8 @@ where
             if let Some((_, dmabuf)) = &target.cached_buffer {
                 if dmabuf.size() != buffer_size || BufferTrait::format(dmabuf).code != target.format {
                     *target.cached_buffer = None;
+                    // dst buffers are stale too (wrong size/format)
+                    target.bridge_dsts.0.clear();
                 }
             };
 
@@ -1322,12 +1341,33 @@ where
                 }
             }
             let framebuffer = self.render.renderer_mut().bind(dmabuf).map_err(Error::Render)?;
-            let bridge = match &mut *target.bridge {
-                BridgeState::Ready(bridge) => Some(bridge),
-                _ => None,
+            let (bridge, bridge_dst) = match &mut *target.bridge {
+                BridgeState::Ready(bridge) => {
+                    // pick the next destination buffer from the ring,
+                    // allocating from the TARGET device's allocator as LINEAR
+                    const DST_RING_SIZE: usize = 3;
+                    let (ring, idx) = &mut *target.bridge_dsts;
+                    let dst_idx = *idx % DST_RING_SIZE;
+                    *idx = idx.wrapping_add(1);
+                    if ring.len() <= dst_idx {
+                        match target.device.allocator().create_buffer(
+                            buffer_size.w as u32,
+                            buffer_size.h as u32,
+                            target.format,
+                            &[Modifier::Linear],
+                        ) {
+                            Ok(bo) => ring.push(bo),
+                            Err(err) => {
+                                warn!("vulkan bridge: failed to allocate dst buffer: {err}");
+                            }
+                        }
+                    }
+                    (Some(bridge), ring.get(dst_idx).cloned())
+                }
+                _ => (None, None),
             };
 
-            Some((&mut target.device, framebuffer, texture, target.format, staging_dmabuf, bridge))
+            Some((&mut target.device, framebuffer, texture, target.format, staging_dmabuf, bridge, bridge_dst))
         } else {
             None
         };
@@ -1352,7 +1392,7 @@ where
                     .map_err(Error::Render)?
             }
             MultiFramebufferInternal::Target(target_framebuffer) => {
-                let (target_device, render_framebuffer, texture, format, staging_dmabuf, bridge) =
+                let (target_device, render_framebuffer, texture, format, staging_dmabuf, bridge, bridge_dst) =
                     target_state.unwrap();
                 target = Some(TargetFrameData {
                     device: target_device,
@@ -1360,6 +1400,7 @@ where
                     texture,
                     format,
                     dmabuf: Some(staging_dmabuf),
+                    bridge_dst,
                     bridge,
                 });
                 let mut render_framebuffer = AliasableBox::from_unique(Box::new(render_framebuffer));
@@ -1654,8 +1695,8 @@ where
                 // regions would not cover this frame's damage, sampling
                 // uninitialized garbage (the "cycling glitched frame" bug).
                 if let Some(bridge) = target.bridge.as_mut() {
-                    if let Some(staging) = target.dmabuf.clone() {
-                        bridge.submit_copy(staging, sync.clone(), Vec::new());
+                    if let (Some(staging), Some(dst)) = (target.dmabuf.clone(), target.bridge_dst.clone()) {
+                        bridge.submit_copy(staging, dst, sync.clone(), Vec::new());
                     }
                 }
                 let bridged_texture = target
