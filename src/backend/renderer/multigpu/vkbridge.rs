@@ -24,7 +24,7 @@ use tracing::{debug, info, warn};
 
 use crate::backend::{
     allocator::{
-        dmabuf::{Dmabuf, DmabufFlags},
+        dmabuf::Dmabuf,
         vulkan::format::get_vk_format,
         Buffer,
     },
@@ -114,7 +114,7 @@ fn early_init(vendor_id: Option<u32>) -> Result<Preinit, VkBridgeError> {
 }
 
 /// Take the pre-initialization receiver, if [`preinit`] was called.
-pub fn take_preinit() -> Option<std::sync::mpsc::Receiver<InitResult>> {
+fn take_preinit() -> Option<std::sync::mpsc::Receiver<InitResult>> {
     PREINIT.lock().unwrap().take()
 }
 
@@ -174,7 +174,6 @@ struct BridgeCore {
     queue: vk::Queue,
     queue_family: u32,
     cmd_pool: vk::CommandPool,
-    get_memory_fd: khr::external_memory_fd::Device,
     get_semaphore_fd: khr::external_semaphore_fd::Device,
     state: std::sync::Mutex<CopyState>,
 }
@@ -208,7 +207,8 @@ struct CopyJob {
     /// device's allocator). The worker publishes this same dmabuf on
     /// completion — no export step from the render gpu needed.
     dst: Dmabuf,
-    sync: crate::backend::renderer::sync::SyncPoint,
+    /// Keep the render sync point alive until the worker consumes this job.
+    _sync: crate::backend::renderer::sync::SyncPoint,
     /// Exported native fence fd for the render sync point. The worker polls
     /// it instead of calling into EGL's client wait, which spins a cpu core
     /// on the proprietary nvidia driver.
@@ -225,13 +225,14 @@ struct CopyJob {
 /// EGL fence fds — and the compositor never blocks on the copy, at the cost
 /// of one frame of latency on the target output.
 pub struct VkBridge {
-    core: std::sync::Arc<BridgeCore>,
+    /// Keep the Vulkan objects alive for the lifetime of the bridge.
+    _core: std::sync::Arc<BridgeCore>,
     sender: std::sync::mpsc::SyncSender<CopyJob>,
     latest: std::sync::Arc<std::sync::Mutex<Option<(usize, Dmabuf, std::os::fd::OwnedFd)>>>,
     /// Sequence counter for completed copies (consumers only present a copy
     /// once — re-presenting a stale copy caused ghost frames when content
-    /// disappeared faster than new copies arrived).
-    copy_seq: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// disappeared faster than new copies arrived). The worker updates it.
+    _copy_seq: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     last_presented: std::sync::atomic::AtomicUsize,
     /// Optional callback invoked whenever a copy completes; the compositor's
     /// event loop uses it to schedule a present for the completed frame
@@ -435,32 +436,6 @@ impl BridgeCore {
         let src_img = self.ensure_src_image(src, vk_format)?;
         let dst_img = self.ensure_dst_import(dst, vk_format)?;
         self.copy_inner_synced(src, src_img, dst_img, wait_fd, regions)
-    }
-
-    fn copy_to_linear_blocking(
-        &self,
-        src: &Dmabuf,
-        dst: &Dmabuf,
-        regions: &[crate::utils::Rectangle<i32, crate::utils::Buffer>],
-    ) -> Result<(), VkBridgeError> {
-        if src.num_planes() != 1 {
-            return Err(VkBridgeError::Unsupported);
-        }
-        let format = src.format().code;
-        let vk_format = get_vk_format(format).ok_or(VkBridgeError::Unsupported)?;
-        let (w, h) = (src.size().w as u32, src.size().h as u32);
-        let src_modifier = src.format().modifier;
-        let src_stride = src.strides().next().ok_or(VkBridgeError::Unsupported)?;
-        let src_offset = src.offsets().next().ok_or(VkBridgeError::Unsupported)?;
-        let src_fd = src.handles().next().ok_or(VkBridgeError::Unsupported)?;
-        // stride/offset are not passed to vulkan: the layout is fully described by
-        // the drm format modifier used for the import.
-        let _ = (src_stride, src_offset);
-
-        let _ = vk_format; // layout is fully described by the drm modifier
-        let src_img = self.ensure_src_image(src, vk_format)?;
-        let dst_img = self.ensure_dst_import(dst, vk_format)?;
-        self.copy_inner(src, src_img, dst_img, None, None, regions)
     }
 
     fn copy_inner_synced(
@@ -829,7 +804,6 @@ impl VkBridge {
             )
         }?;
         info!("vkbridge: queue + cmd pool ok");
-        let get_memory_fd = khr::external_memory_fd::Device::new(&instance, &device);
         let get_semaphore_fd = khr::external_semaphore_fd::Device::new(&instance, &device);
 
         info!("vkbridge: initialized");
@@ -841,7 +815,6 @@ impl VkBridge {
             queue,
             queue_family,
             cmd_pool,
-            get_memory_fd,
             get_semaphore_fd,
             state: std::sync::Mutex::new(CopyState::default()),
         });
@@ -866,10 +839,10 @@ impl VkBridge {
                 .map_err(|err| VkBridgeError::Setup(format!("failed to spawn copy worker: {err}")))?
         };
         Ok(VkBridge {
-            core,
+            _core: core,
             sender,
             latest,
-            copy_seq,
+            _copy_seq: copy_seq,
             last_presented: std::sync::atomic::AtomicUsize::new(0),
             // share the SAME Arc the worker holds, so set_completion_notifier
             // updates reach the worker (a fresh Arc here would never propagate)
@@ -895,7 +868,13 @@ impl VkBridge {
         self.submitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self
             .sender
-            .try_send(CopyJob { src, dst, sync, wait_fd, regions })
+            .try_send(CopyJob {
+                src,
+                dst,
+                _sync: sync,
+                wait_fd,
+                regions,
+            })
             .is_err()
         {
             debug!("vkbridge: copy queue full, skipping frame copy");
