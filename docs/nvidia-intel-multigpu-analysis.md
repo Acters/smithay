@@ -32,7 +32,7 @@ So every cross-GPU frame on this stack bounced through CPU memory (glReadPixels 
 
 ## 2. The Interop Probe Matrix
 
-All probe-verified on nvidia 610.43.03 + i915. Probes in `~/niri-bisect/`: `xb30_probe.c`, `vkbridge_poc.c`, `fence_diag.c`, `vk_import_test.c`, `vk_export_test.c`, `gbm_matrix.c`, `intel_gbm_nv_vk_poc.c` (user-authored), `intel_tiled_to_nvidia_vk_probe.c` (user-authored).
+All probe-verified on nvidia 610.43.03 + i915. The source programs are archived in [`docs/probes/`](probes/README.md).
 
 | Path | Verdict |
 |---|---|
@@ -199,7 +199,15 @@ All in `docs/probes/` alongside this document.
 | `gbm_matrix.c` | NVIDIA GBM allocation flags matrix (renderable = block-linear only; LINEAR = CPU-access only) |
 | `intel_gbm_nv_vk_poc.c` | Intel-owned LINEAR BO → NVIDIA Vulkan writes → Intel reads (with sync-fd semaphores) — PASS |
 | `intel_tiled_to_nvidia_vk_probe.c` | NVIDIA advertises no i915 tiling modifiers (X/Y/Yf/4/CCS all blocked) |
-| `multigpu_layout_bench` | Throughput table in §3 |
+| `multigpu_layout_bench.c` | Throughput table in §3 |
+| `multigpu_compositor_path_bench_batched_fixed.c` | Compositor-style comparison of direct LINEAR and tiled-to-LINEAR paths |
+| `nvmod_to_intel.c` | NVIDIA-native GBM buffer import checks through Intel GBM/EGL and an Intel Vulkan modifier capability query |
+| `vk_wayland_probe.c` | Per-GPU Vulkan Wayland presentation support |
+| `wayland_drm_syncobj_poc.c` | Wayland DMA-BUF client using syncobj acquire and release timelines |
+| `vkbridge_poc2.c` | Historical XR24/XB30 bridge experiment with a shader fallback |
+| `vkbridge_thread_test.c` | Historical worker-thread Vulkan initialization diagnostic |
+
+See [`docs/probes/README.md`](probes/README.md) for build notes and hardware assumptions.
 
 ---
 
