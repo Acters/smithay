@@ -98,12 +98,18 @@ pub fn preinit(vendor_id: Option<u32>) {
 }
 
 fn early_init(preferred: Option<u32>) -> InitResult {
+    let started = std::time::Instant::now();
+    tracing::info!("Vulkan transfer instance initialization started");
     let entry = unsafe { ash::Entry::load() }.map_err(|e| VkBridgeError::Setup(e.to_string()))?;
     let app = vk::ApplicationInfo::default()
         .application_name(c"smithay-vkbridge")
         .api_version(vk::API_VERSION_1_2);
     let instance =
         unsafe { entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None) }?;
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis(),
+        "Vulkan transfer instance created"
+    );
     Ok(Preinit {
         _entry: entry,
         instance,
@@ -344,7 +350,13 @@ impl std::fmt::Debug for VkBridge {
 impl VkBridge {
     /// Create the logical device on exactly `node`, consuming preinitialization if available.
     pub fn new(node: DrmNode) -> Result<Self, VkBridgeError> {
+        let started = std::time::Instant::now();
         let receiver = PREINIT.lock().unwrap().take();
+        tracing::info!(
+            ?node,
+            preinitialized = receiver.is_some(),
+            "Vulkan transfer device initialization started"
+        );
         let init = match receiver {
             Some(rx) => rx
                 .recv()
@@ -435,6 +447,11 @@ impl VkBridge {
         let semaphore_fd =
             semaphore_extension.then(|| khr::external_semaphore_fd::Device::new(&init.instance, &device));
         let features = semaphore_props.external_semaphore_features;
+        tracing::info!(
+            ?node,
+            elapsed_ms = started.elapsed().as_millis(),
+            "Vulkan transfer device ready"
+        );
         Ok(Self {
             core: Arc::new(Core {
                 init,
