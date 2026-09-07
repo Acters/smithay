@@ -32,7 +32,7 @@ So every cross-GPU frame on this stack bounced through CPU memory (glReadPixels 
 
 ## 2. The Interop Probe Matrix
 
-All probe-verified on nvidia 610.43.03 + i915. Probes in `~/niri-bisect/`: `xb30_probe.c`, `vkbridge_poc.c`, `fence_diag.c`, `vk_import_test.c`, `vk_export_test.c`, `gbm_matrix.c`, `intel_gbm_nv_vk_poc.c` (user-authored), `intel_tiled_to_nvidia_vk_probe.c` (user-authored).
+All probe-verified on nvidia 610.43.03 + i915. The source programs are archived in [`docs/probes/`](probes/README.md).
 
 | Path | Verdict |
 |---|---|
@@ -50,7 +50,7 @@ All probe-verified on nvidia 610.43.03 + i915. Probes in `~/niri-bisect/`: `xb30
 - **cubanismo (NVIDIA engineer)**: foreign dma-buf import works via **nvidia-drm's PRIME helpers** (the kernel's standard dma-buf framework), NOT via the separate resource-manager dma-buf code (which only understands NVIDIA's own buffers and is unrelated). The 2022 "import impossible" analysis quoted the wrong layer. Validated: EGL import works (linear + EXTERNAL_OES); Vulkan import works (`TILING_DRM_FORMAT_MODIFIER_EXT` + explicit plane layout + `vkGetMemoryFdPropertiesKHR` + dedicated alloc).
 - **`VK_IMAGE_TILING_LINEAR` ≠ `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT`.** For externally produced dma-bufs, the modifier extension is required to supply the foreign stride/offset. The earlier import failures were entirely due to using OPTIMAL/LINEAR tiling with the modifier *list* struct instead of the *explicit* struct.
 - **`external_only=1` in the EGL modifier query** explains the TEXTURE_2D failure: NVIDIA EGL accepts LINEAR dma-bufs only as `GL_TEXTURE_EXTERNAL_OES` (external sampling), never as ordinary TEXTURE_2D (which includes render-target use).
-- **Memory placement decides shareability.** NVIDIA GBM's flags-0 LINEAR allocation lands in device VRAM: Intel's PRIME import calls `nv_drm_gem_prime_get_sg_table()` → `-ENOMEM` → reads zeros (probe: NVIDIA-side readback shows correct pixels `BGRA = 0 0 255 0`, Intel-side reads `0 0 0 0`). The Vulkan `EXPORT_MEMORY`-typed linear allocation lands in shareable/system RAM → Intel reads correctly. This is why the destination must be Vulkan-allocated (or Intel-owned), not NVIDIA-GBM-allocated.
+- **Memory placement decides shareability.** NVIDIA GBM's flags-0 LINEAR allocation lands in device VRAM: Intel's PRIME import calls `nv_drm_gem_prime_get_sg_table()` → `-ENOMEM` → reads zeros (probe: NVIDIA-side readback shows correct pixels `BGRA = 0 0 255 0`, Intel-side reads `0 0 0 0`). The Vulkan `EXPORT_MEMORY`-typed linear allocation is backed in a way that NVIDIA PRIME can map for Intel → Intel reads correctly. Its exact physical placement was not directly inspected. This is why the destination must be Vulkan-allocated (or Intel-owned), not NVIDIA-GBM-allocated.
 - **NVIDIA fence interop is broken cross-API**: Vulkan-exported fence fds are NOT pollable sync_files (fdinfo shows no sync_file marker; poll never signals). EGL-exported fence fds poll fine but can't enter Vulkan (`VK_ERROR_INVALID_EXTERNAL_HANDLE`). So cross-driver fence-based explicit sync is unavailable; the only working sync primitives are CPU waits (EGL client-wait, `vkQueueWaitIdle`) and Vulkan sync-fd semaphores (VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT, which DOES work — proven in the user's `intel_gbm_nv_vk_poc.c`).
 
 ---
@@ -199,7 +199,15 @@ All in `docs/probes/` alongside this document.
 | `gbm_matrix.c` | NVIDIA GBM allocation flags matrix (renderable = block-linear only; LINEAR = CPU-access only) |
 | `intel_gbm_nv_vk_poc.c` | Intel-owned LINEAR BO → NVIDIA Vulkan writes → Intel reads (with sync-fd semaphores) — PASS |
 | `intel_tiled_to_nvidia_vk_probe.c` | NVIDIA advertises no i915 tiling modifiers (X/Y/Yf/4/CCS all blocked) |
-| `multigpu_layout_bench` | Throughput table in §3 |
+| `multigpu_layout_bench.c` | Throughput table in §3 |
+| `multigpu_compositor_path_bench_batched_fixed.c` | Compositor-style comparison of direct LINEAR and tiled-to-LINEAR paths |
+| `nvmod_to_intel.c` | NVIDIA-native GBM buffer import checks through Intel GBM/EGL and an Intel Vulkan modifier capability query |
+| `vk_wayland_probe.c` | Per-GPU Vulkan Wayland presentation support |
+| `wayland_drm_syncobj_poc.c` | Wayland DMA-BUF client using syncobj acquire and release timelines |
+| `vkbridge_poc2.c` | Historical XR24/XB30 bridge experiment with a shader fallback |
+| `vkbridge_thread_test.c` | Historical worker-thread Vulkan initialization diagnostic |
+
+See [`docs/probes/README.md`](probes/README.md) for build notes and hardware assumptions.
 
 ---
 
