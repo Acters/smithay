@@ -89,8 +89,10 @@ one-shot bootstrap, vendor preference or early call from niri's main function.
 A real niri session with early preparation disabled created the raw Vulkan instance
 after DRM/display startup in 318 ms and had its logical device ready after 417 ms.
 Native-fence transfers activated successfully on NVIDIA 610.57.04. The wrapper-based
-version also passes offscreen engine/MultiRenderer probes, including reconstruction
-after invalidation; its real-session check is the next adoption gate.
+version passes offscreen engine/MultiRenderer probes, including reconstruction after
+invalidation, and a real niri session: late instance creation took 198 ms, the device
+was ready after 275 ms, and native-fence transfers activated normally. The user
+confirmed that the resulting build looks correct.
 
 Keep initialization off the compositor event-loop thread. During the raw late-init
 experiment, an X11 connection caused niri to start xwayland-satellite while instance
