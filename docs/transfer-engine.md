@@ -159,5 +159,22 @@ On NVIDIA 610.57.04 / Intel Mesa 26.2.2:
 
 These are correctness/interoperability probes, not frame-rate benchmarks. Khronos
 validation layers were not installed, so no validation-layer success is claimed.
-Compositor-session adoption, initialization-order tests, more fault injection,
-suspend/hotplug tests and any direct Vulkan-to-KMS work are separate gates.
+Phase-one and lazy-initialization compositor sessions were adopted with user visual
+confirmation. More fault injection, suspend/hotplug tests and direct Vulkan-to-KMS
+work remain separate gates.
+
+## Scanout-allocation feasibility (not KMS validation)
+
+On `nvidia-intel-bridge-scanout-probe`, the render-only example accepts
+`--scanout-candidate`. Build additionally with
+`backend_gbm_has_create_with_modifiers2`; this ensures usage flags are passed
+alongside the explicit modifier rather than ignored by the older modifier API.
+The destination requests `SCANOUT|RENDERING` and explicit LINEAR. Exported
+implicit/non-LINEAR descriptors are rejected.
+
+Both ABGR8888 and ABGR2101010 passed 24 copied/readback frames at 1920x1080 and
+1952x1104, including partial updates and midtones. Vulkan populated the candidate
+buffer; target GLES only sampled it for verification. No KMS framebuffer, atomic
+TEST_ONLY request, native KMS fence import, modeset or actual display was attempted
+by these render-node-only tests. Successful allocation/readback does not establish
+that a particular KMS plane/mode accepts the candidate.

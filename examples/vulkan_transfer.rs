@@ -97,6 +97,9 @@ struct Args {
     /// Test the real MultiRenderer path; Vulkan route proof additionally requires debug logs.
     #[arg(long)]
     multigpu: bool,
+    /// Request SCANOUT|RENDERING destination allocations (still no KMS/display access).
+    #[arg(long, conflicts_with = "multigpu")]
+    scanout_candidate: bool,
 }
 
 fn parse_modifier(value: &str) -> Result<u64, std::num::ParseIntError> {
@@ -319,9 +322,25 @@ fn run_size(
     // Match MultiRenderer's allocation path: request the explicit modifier,
     // not GBM's legacy LINEAR usage flag (which produces an implicit descriptor
     // on builds without create_with_modifiers2).
-    let destination_bo = target
-        .allocator
-        .create_buffer(w as u32, h as u32, format, &[Modifier::Linear])?;
+    let destination_bo = if args.scanout_candidate {
+        if !cfg!(feature = "backend_gbm_has_create_with_modifiers2") {
+            return Err("--scanout-candidate requires backend_gbm_has_create_with_modifiers2 so GBM receives usage flags together with explicit modifiers".into());
+        }
+        println!(
+            "SCANOUT CANDIDATE: requesting SCANOUT|RENDERING with explicit LINEAR; KMS admissibility is NOT tested"
+        );
+        target.allocator.create_buffer_with_flags(
+            w as u32,
+            h as u32,
+            format,
+            &[Modifier::Linear],
+            GbmBufferFlags::SCANOUT | GbmBufferFlags::RENDERING,
+        )?
+    } else {
+        target
+            .allocator
+            .create_buffer(w as u32, h as u32, format, &[Modifier::Linear])?
+    };
     let mut src = source_bo.export()?;
     let dst = destination_bo.export()?;
     if dst.format().modifier != Modifier::Linear || src.format().modifier == Modifier::Invalid {
@@ -637,6 +656,11 @@ fn main() -> ProbeResult<()> {
     let mut target = Gpu::new(target_file)?;
     for (w, h) in [(args.width, args.height), (args.width + 32, args.height + 24)] {
         run_size(&mut bridge, &mut source, &mut target, &args, w as i32, h as i32)?;
+    }
+    if args.scanout_candidate {
+        println!(
+            "PASS SCANOUT-requested allocation/copy/readback only; no KMS framebuffer, atomic test, fence import, or display was attempted"
+        );
     }
     println!(
         "PASS Vulkan transfer probe: {:?}, {} frames, two sizes, reused buffers and partial damage",
