@@ -244,4 +244,19 @@ texture, including when caches were cleared while a framebuffer remained bound.
 One failed early probe fixture submitted unbounded geometry directly to GLES while
 its oracle used clipped damage. The explicit-GLES fallback fixture was corrected
 to submit bounded geometry; out-of-bounds inputs remain in the MultiRenderer/direct
-clipping cases. Actual direct KMS display adoption is a separate remaining gate.
+clipping cases.
+
+### Approved live adoption
+
+The user separately approved an actual display test with niri `9ee3ff77` and Smithay
+`0e2ad6d1`. On eDP-1, the compositor negotiated ABGR2101010 with explicit LINEAR and
+logged direct Vulkan writes into the bound framebuffer with native fences. The
+internal ~144 Hz, DP ~240 Hz and HDMI ~75 Hz outputs remained active, without observed
+render/queue errors. The user confirmed the resulting display looks correct and
+asked to keep direct mode enabled. It is enabled in that user's service through
+`NIRI_VK_DIRECT_TARGET=1`; the library default remains off and the intermediate route
+remains available for unsupported cases.
+
+This establishes the tested live path on this machine, not a universal driver
+compatibility or performance claim. No per-output renderer migration, dynamic GPU
+selection, long-term soak result, or measured power/latency benefit is implied.
