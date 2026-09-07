@@ -1,5 +1,11 @@
 # Cross-GPU Multigpu Bridge: Analysis, Design, and Results
 
+> Historical investigation of the previous-frame worker implementation. On the
+> `nvidia-intel-bridge-transfer-engine` branch, see [the same-frame transfer design](transfer-engine.md)
+> for current ownership, synchronization, negotiation and validation status. Claims
+> below about initialization, synchronization and performance record the original
+> experiments; they are not guarantees of the current implementation.
+
 **Hardware:** Intel UHD 630 (i915, internal eDP-1) + NVIDIA GTX 1660 Ti Mobile (nvidia 610.43.03, external DP-1 @ 240 Hz, HDMI-A-1)
 **Stack:** CachyOS, kernel 7.1.5, niri 26.04 (fork), smithay ff5fa7d (fork)
 

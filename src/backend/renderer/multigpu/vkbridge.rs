@@ -1,1003 +1,1089 @@
-//! Vulkan-assisted cross-GPU copy bridge.
+//! Same-frame Vulkan dma-buf transfer engine.
 //!
-//! Some driver stacks (notably proprietary NVIDIA) cannot share dmabufs with other
-//! vendors through GL/EGL: the render GPU can only render into its own tiled
-//! modifiers, which foreign GPUs cannot import, and it cannot import linear or
-//! foreign-tiled buffers either. In that situation smithay's multigpu renderer
-//! falls back to a cpu-copy (glReadPixels + upload) for every frame.
+//! The caller owns both allocations and their reuse fences. A successful [`VkBridge::copy`]
+//! submits the requested frame, returning its fence without waiting for the copy to finish.
+//! Wait that fence before sampling the destination AND before rendering into the source again.
+//! Pass the previous destination reader's release fence on its next use. Damage is in raw
+//! buffer coordinates; callers handle empty damage and initialize newly allocated destinations.
 //!
-//! Vulkan transfer operations have no such limitation: a foreign dmabuf can be
-//! imported via `VK_EXT_external_memory_dmabuf`, copied on-GPU into a LINEAR image,
-//! and re-exported as a dmabuf which other vendors (e.g. Mesa/i915) can import.
-//! This module implements that copy. It is used as a fast path between the direct
-//! dmabuf share and the cpu-copy fallback.
-//!
-//! Synchronization is the caller's responsibility for now: the source buffer's
-//! rendering must have completed before [`VkBridge::copy_to_linear`] is invoked
-//! (e.g. by blocking on the render [`crate::backend::renderer::sync::SyncPoint`]),
-//! and this bridge blocks (`vkQueueWaitIdle`) before returning the exported dmabuf.
+//! Imported images use explicit modifiers and GENERAL at the foreign API boundary. Both APIs
+//! must relinquish the buffers while the copy owns them. This is not an implicit-sync adapter.
 
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
-
-use ash::{ext, khr, vk};
-use tracing::{debug, info, warn};
-
-use crate::backend::{
-    allocator::{
-        dmabuf::Dmabuf,
-        vulkan::format::get_vk_format,
-        Buffer,
-    },
-    drm::DrmNode,
+use std::{
+    collections::VecDeque,
+    ffi::CStr,
+    os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
+    sync::Arc,
 };
 
-// ---------------------------------------------------------------------------
-// Early (pre-DRM-master) initialization support.
-//
-// On proprietary NVIDIA, creating a vulkan instance from *inside* a compositor
-// process that already holds DRM master deadlocks the ICD. Initializing on a
-// background thread spawned before the compositor opens its DRM devices avoids
-// this. niri (or another compositor) should call [`preinit`] as early as
-// possible in main(); the multigpu renderer picks the result up later.
-// ---------------------------------------------------------------------------
+use ash::{ext, khr, vk};
+use tracing::warn;
 
-/// Early-stage vulkan objects created before the compositor acquires DRM
-/// master. Only the *instance* may be created pre-master: vkCreateInstance
-/// deadlocks the proprietary NVIDIA ICD once master is held, and a full
-/// device created this early breaks direct scanout on the NVIDIA output.
+use crate::{
+    backend::{
+        allocator::{
+            Buffer as AllocatorBuffer, Fourcc, Modifier,
+            dmabuf::{Dmabuf, DmabufFlags},
+            vulkan::format::get_vk_format,
+        },
+        drm::DrmNode,
+        renderer::sync::{Fence, Interrupted, SyncPoint},
+    },
+    utils::{Buffer, Rectangle},
+};
+
+/// Failure to initialize or submit a transfer. No successful submission is hidden by an error.
+#[derive(Debug, thiserror::Error)]
+pub enum VkBridgeError {
+    /// Loader, capability or device selection failure.
+    #[error("vulkan setup failed: {0}")]
+    Setup(String),
+    /// Vulkan rejected an operation.
+    #[error("vulkan error: {0:?}")]
+    Vk(#[from] vk::Result),
+    /// Unsupported or inconsistent buffer descriptors or damage.
+    #[error("unsupported dma-buf transfer: {0}")]
+    Unsupported(&'static str),
+    /// An input fence could not be waited.
+    #[error("input fence wait interrupted")]
+    Wait(#[from] Interrupted),
+    /// Duplicating a dma-buf failed.
+    #[error("dma-buf fd error: {0}")]
+    Io(#[from] std::io::Error),
+    /// Bound outstanding work instead of accumulating unbounded retained allocations.
+    #[error("too many outstanding Vulkan transfers")]
+    Busy,
+}
+
+impl VkBridgeError {
+    /// Device loss invalidates imported memory contents, not just the transfer route.
+    pub fn is_device_lost(&self) -> bool {
+        matches!(self, Self::Vk(vk::Result::ERROR_DEVICE_LOST))
+    }
+}
+
+// Only instance creation happens before DRM master acquisition. Device creation remains in
+// new(): moving it into preinit can interfere with direct scanout on proprietary NVIDIA.
 struct Preinit {
-    entry: ash::Entry,
+    _entry: ash::Entry,
     instance: ash::Instance,
-    phd: vk::PhysicalDevice,
+    preferred: Option<u32>,
+}
+
+impl Drop for Preinit {
+    fn drop(&mut self) {
+        unsafe { self.instance.destroy_instance(None) };
+    }
 }
 
 type InitResult = Result<Preinit, VkBridgeError>;
-static PREINIT: std::sync::Mutex<Option<std::sync::mpsc::Receiver<InitResult>>> =
-    std::sync::Mutex::new(None);
+static PREINIT: std::sync::Mutex<Option<std::sync::mpsc::Receiver<InitResult>>> = std::sync::Mutex::new(None);
 
-/// Spawn the bridge initialization thread early. `vendor_id` selects the
-/// physical device to use (e.g. 0x10de for NVIDIA); pass `None` to use the
-/// first device that reports a render node.
+/// Create the Vulkan instance before acquiring DRM master; defer logical device creation.
+/// `vendor_id` is a preference only: [`VkBridge::new`] always verifies the exact render node.
 pub fn preinit(vendor_id: Option<u32>) {
-    let mut guard = PREINIT.lock().unwrap();
-    if guard.is_some() {
+    let mut slot = PREINIT.lock().unwrap();
+    if slot.is_some() {
         return;
     }
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
+    match std::thread::Builder::new()
         .name("vkbridge-init".into())
         .spawn(move || {
             let _ = tx.send(early_init(vendor_id));
-        })
-        .expect("failed to spawn vkbridge init thread");
-    *guard = Some(rx);
+        }) {
+        Ok(_) => *slot = Some(rx),
+        Err(err) => warn!(%err, "could not spawn Vulkan preinit"),
+    }
 }
 
-/// The pre-master stage: loader, instance, physical device selection only.
-fn early_init(vendor_id: Option<u32>) -> Result<Preinit, VkBridgeError> {
-    info!("vkbridge: early init start");
-    let entry = unsafe { ash::Entry::load() }
-        .map_err(|err| VkBridgeError::Setup(format!("failed to load vulkan: {err}")))?;
-    let app_info = vk::ApplicationInfo::default()
+fn early_init(preferred: Option<u32>) -> InitResult {
+    let entry = unsafe { ash::Entry::load() }.map_err(|e| VkBridgeError::Setup(e.to_string()))?;
+    let app = vk::ApplicationInfo::default()
         .application_name(c"smithay-vkbridge")
-        .api_version(vk::API_VERSION_1_3);
-    let instance = unsafe {
-        entry.create_instance(
-            &vk::InstanceCreateInfo::default().application_info(&app_info),
-            None,
-        )
-    }?;
-    info!("vkbridge: early instance created");
-
-    let phds = unsafe { instance.enumerate_physical_devices()? };
-    let mut phd = None;
-    let mut fallback = None;
-    for candidate in phds {
-        let props = unsafe { instance.get_physical_device_properties(candidate) };
-        let vendor = props.vendor_id;
-        debug!("vkbridge: phd vendor=0x{vendor:04x}");
-        let matches = match vendor_id {
-            Some(want) => vendor == want,
-            None => vendor != 0x8086,
-        };
-        if matches {
-            phd = Some(candidate);
-            break;
-        }
-        if fallback.is_none() {
-            fallback = Some(candidate);
-        }
-    }
-    let phd = phd.or(fallback).ok_or_else(|| VkBridgeError::Setup("no physical device".into()))?;
-    info!("vkbridge: early init done (device creation deferred)");
-    Ok(Preinit { entry, instance, phd })
+        .api_version(vk::API_VERSION_1_2);
+    let instance =
+        unsafe { entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None) }?;
+    Ok(Preinit {
+        _entry: entry,
+        instance,
+        preferred,
+    })
 }
 
-/// Take the pre-initialization receiver, if [`preinit`] was called.
-fn take_preinit() -> Option<std::sync::mpsc::Receiver<InitResult>> {
-    PREINIT.lock().unwrap().take()
-}
-
-/// Error type for [`VkBridge`] operations.
-#[derive(Debug, thiserror::Error)]
-pub enum VkBridgeError {
-    /// Vulkan instance/device setup failed
-    #[error("vulkan setup failed: {0}")]
-    Setup(String),
-    /// a vulkan call failed
-    #[error("vulkan error: {0:?}")]
-    Vk(vk::Result),
-    /// the source dmabuf cannot be bridged (multi-plane or unknown format)
-    #[error("unsupported dmabuf for bridging")]
-    Unsupported,
-    /// failed to build the exported dmabuf
-    #[error("failed to build exported dmabuf")]
-    Export,
-}
-
-impl From<vk::Result> for VkBridgeError {
-    fn from(err: vk::Result) -> Self {
-        VkBridgeError::Vk(err)
-    }
-}
-
-/// Vulkan copy engine for a single (render) DRM node.
-///
-/// Cheap to keep around once created; all heavy objects are allocated per copy and
-/// released immediately, the exported dmabuf fd owns the underlying memory.
-/// Thread-safe vulkan handles shared between the compositor thread and the
-/// copy worker. All command submission happens on the worker.
-/// Per-frame reusable vulkan state. The staging dmabuf is persistent across
-/// frames, so its import image is created once and reused; creating/importing
-/// images every frame caused heavy nvidia driver lock contention.
-#[derive(Default)]
-struct CopyState {
-    cmd: Option<vk::CommandBuffer>,
-    /// (fd, modifier, format, w, h) of the currently imported source
-    src_key: Option<(i32, u64, vk::Format, u32, u32)>,
-    src_image: Option<(vk::Image, vk::DeviceMemory)>,
-    /// Imported destination images, keyed by dmabuf fd. The destination
-    /// buffers are owned by the TARGET gpu's allocator (Intel GBM), imported
-    /// here for the vulkan copy. Imported once and reused — the import is
-    /// expensive (driver lock traffic).
-    dst_imports: std::collections::HashMap<i32, (vk::Image, vk::DeviceMemory)>,
-    mem_type_cache: std::collections::HashMap<u32, u32>,
-}
-
-/// Thread-safe vulkan handles shared between the compositor thread and the
-/// copy worker. All command submission happens on the worker.
-struct BridgeCore {
-    entry: ash::Entry,
-    instance: ash::Instance,
+struct Core {
+    init: Preinit,
     phd: vk::PhysicalDevice,
     device: ash::Device,
     queue: vk::Queue,
-    queue_family: u32,
-    cmd_pool: vk::CommandPool,
-    get_semaphore_fd: khr::external_semaphore_fd::Device,
-    state: std::sync::Mutex<CopyState>,
+    family: u32,
+    memory_fd: khr::external_memory_fd::Device,
+    semaphore_fd: Option<khr::external_semaphore_fd::Device>,
+    import_sync_fd: bool,
+    export_sync_fd: bool,
 }
 
-impl Drop for BridgeCore {
+impl Core {
+    fn modifier_properties(&self, format: vk::Format) -> Vec<vk::DrmFormatModifierPropertiesEXT> {
+        let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+        let mut props = vk::FormatProperties2::default().push_next(&mut list);
+        unsafe {
+            self.init
+                .instance
+                .get_physical_device_format_properties2(self.phd, format, &mut props)
+        };
+        let mut modifiers =
+            vec![vk::DrmFormatModifierPropertiesEXT::default(); list.drm_format_modifier_count as usize];
+        list.p_drm_format_modifier_properties = modifiers.as_mut_ptr();
+        let mut props = vk::FormatProperties2::default().push_next(&mut list);
+        unsafe {
+            self.init
+                .instance
+                .get_physical_device_format_properties2(self.phd, format, &mut props)
+        };
+        modifiers.truncate(list.drm_format_modifier_count as usize);
+        modifiers
+    }
+
+    // Match the image created by import exactly: 2D, explicit modifier, exclusive sharing,
+    // no image-create flags, one mip/layer/sample and DMA_BUF external memory.
+    fn import_properties(
+        &self,
+        format: vk::Format,
+        modifier: u64,
+        usage: vk::ImageUsageFlags,
+    ) -> Result<Option<vk::ImageFormatProperties>, VkBridgeError> {
+        let mut modifier_info = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let mut external_info = vk::PhysicalDeviceExternalImageFormatInfo::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let info = vk::PhysicalDeviceImageFormatInfo2::default()
+            .format(format)
+            .ty(vk::ImageType::TYPE_2D)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(usage)
+            .push_next(&mut modifier_info)
+            .push_next(&mut external_info);
+        let mut external_props = vk::ExternalImageFormatProperties::default();
+        let mut image_props = vk::ImageFormatProperties2::default().push_next(&mut external_props);
+        match unsafe {
+            self.init
+                .instance
+                .get_physical_device_image_format_properties2(self.phd, &info, &mut image_props)
+        } {
+            Ok(()) => {}
+            Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED) => return Ok(None),
+            Err(err) => return Err(err.into()),
+        }
+        let limits = image_props.image_format_properties;
+        let external = external_props.external_memory_properties;
+        Ok((external
+            .external_memory_features
+            .contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+            && external
+                .compatible_handle_types
+                .contains(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT))
+        .then_some(limits))
+    }
+}
+
+impl Drop for Core {
+    fn drop(&mut self) {
+        // Every image and batch owns this core. The last reference can disappear only after
+        // all submitted batches have retired; no global queue-idle wait is needed here.
+        unsafe { self.device.destroy_device(None) };
+    }
+}
+
+struct Imported {
+    core: Arc<Core>,
+    // Pointer-stable Dmabuf identity, not an fd number. Retaining it prevents allocation reuse.
+    dmabuf: Dmabuf,
+    source: bool,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+}
+
+impl Drop for Imported {
     fn drop(&mut self) {
         unsafe {
-            let mut state = self.state.lock().unwrap();
-            if let Some((img, mem)) = state.src_image.take() {
-                self.device.destroy_image(img, None);
-                self.device.free_memory(mem, None);
-            }
-            if let Some(cmd) = state.cmd.take() {
-                self.device.free_command_buffers(self.cmd_pool, &[cmd]);
-            }
-            for (_, (img, mem)) in state.dst_imports.drain() {
-                self.device.destroy_image(img, None);
-                self.device.free_memory(mem, None);
-            }
-            self.device.destroy_command_pool(self.cmd_pool, None);
-            self.device.destroy_device(None);
-            self.instance.destroy_instance(None);
+            self.core.device.destroy_image(self.image, None);
+            self.core.device.free_memory(self.memory, None);
         }
-        let _ = &self.entry;
     }
 }
 
-struct CopyJob {
-    src: Dmabuf,
-    /// The target-gpu-owned destination buffer (allocated by the target
-    /// device's allocator). The worker publishes this same dmabuf on
-    /// completion — no export step from the render gpu needed.
-    dst: Dmabuf,
-    /// Keep the render sync point alive until the worker consumes this job.
-    _sync: crate::backend::renderer::sync::SyncPoint,
-    /// Exported native fence fd for the render sync point. The worker polls
-    /// it instead of calling into EGL's client wait, which spins a cpu core
-    /// on the proprietary nvidia driver.
-    wait_fd: Option<std::os::fd::OwnedFd>,
-    regions: Vec<crate::utils::Rectangle<i32, crate::utils::Buffer>>,
+// One pool per batch avoids externally synchronized command-pool operations between the
+// compositor and a SyncPoint dropped on another thread. There is no Core -> Batch reference.
+struct Resources {
+    core: Arc<Core>,
+    _images: [Arc<Imported>; 2],
+    pool: vk::CommandPool,
+    fence: vk::Fence,
+    semaphores: Vec<vk::Semaphore>,
 }
 
-/// Vulkan copy engine for a single (render) DRM node.
-///
-/// Copies run on a background worker thread: the compositor submits jobs
-/// (staging dmabuf + render sync point) and picks up the latest completed
-/// linear dmabuf a frame later. No cross-driver fence fds are used — the
-/// nvidia proprietary driver cannot export pollable fence fds nor import
-/// EGL fence fds — and the compositor never blocks on the copy, at the cost
-/// of one frame of latency on the target output.
-pub struct VkBridge {
-    /// Keep the Vulkan objects alive for the lifetime of the bridge.
-    _core: std::sync::Arc<BridgeCore>,
-    sender: std::sync::mpsc::SyncSender<CopyJob>,
-    latest: std::sync::Arc<std::sync::Mutex<Option<(usize, Dmabuf, std::os::fd::OwnedFd)>>>,
-    /// Sequence counter for completed copies (consumers only present a copy
-    /// once — re-presenting a stale copy caused ghost frames when content
-    /// disappeared faster than new copies arrived). The worker updates it.
-    _copy_seq: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    last_presented: std::sync::atomic::AtomicUsize,
-    /// Optional callback invoked whenever a copy completes; the compositor's
-    /// event loop uses it to schedule a present for the completed frame
-    /// (without it, completed copies wait for unrelated damage to be shown).
-    completion_notifier:
-        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>>,
-    /// Number of submitted copy jobs (shared with the worker's completed
-    /// counter). Used to keep the compositor from rendering into the staging
-    /// buffer while the worker is still copying it.
-    submitted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    completed: std::sync::Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
-    worker: Option<std::thread::JoinHandle<()>>,
-}
-
-impl BridgeCore {
-    /// Import (or reuse the cached import of) the staging dmabuf as a vulkan
-    /// image. The staging buffer is persistent, so this almost always hits
-    /// the cache; the per-frame create/import/destroy churn contended badly
-    /// with GL rendering inside the nvidia driver.
-    fn ensure_src_image(&self, src: &Dmabuf, vk_format: vk::Format) -> Result<vk::Image, VkBridgeError> {
-        let (w, h) = (src.size().w as u32, src.size().h as u32);
-        let src_modifier = src.format().modifier;
-        let src_fd = src.handles().next().ok_or(VkBridgeError::Unsupported)?;
-        let key = (src_fd.as_raw_fd(), src_modifier.into(), vk_format, w, h);
-
-        // cache check WITHOUT holding the lock across driver calls; mem_type
-        // locks the same mutex internally and would self-deadlock otherwise
-        let cached = { self.state.lock().unwrap().src_key };
-        if cached == Some(key) {
-            return Ok(self.state.lock().unwrap().src_image.unwrap().0);
-        }
-        {
-            let mut state = self.state.lock().unwrap();
-            if let Some((img, mem)) = state.src_image.take() {
-                unsafe {
-                    self.device.destroy_image(img, None);
-                    self.device.free_memory(mem, None);
-                }
-            }
-        }
-
-        let src_modifiers = [src_modifier.into()];
-        let mut modifier_list = vk::ImageDrmFormatModifierListCreateInfoEXT::default()
-            .drm_format_modifiers(&src_modifiers);
-        let mut src_external = vk::ExternalMemoryImageCreateInfo::default()
-            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-        let info = vk::ImageCreateInfo::default()
-            .push_next(&mut modifier_list)
-            .push_next(&mut src_external)
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(vk_format)
-            .extent(vk::Extent3D { width: w, height: h, depth: 1 })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::SAMPLED)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED);
-        let img = unsafe { self.device.create_image(&info, None)? };
-
-        let req = unsafe { self.device.get_image_memory_requirements(img) };
-        let dup_fd = unsafe { libc::dup(src_fd.as_raw_fd()) };
-        if dup_fd < 0 {
-            unsafe { self.device.destroy_image(img, None) };
-            return Err(VkBridgeError::Setup("failed to dup dmabuf fd".into()));
-        }
-        let mut import_info = vk::ImportMemoryFdInfoKHR::default()
-            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-            .fd(dup_fd);
-        let mem_type = self
-            .mem_type(req.memory_type_bits, vk::MemoryPropertyFlags::empty())
-            .ok_or(VkBridgeError::Setup("no memory type for src import".into()))?;
-        let alloc = vk::MemoryAllocateInfo::default()
-            .push_next(&mut import_info)
-            .allocation_size(req.size)
-            .memory_type_index(mem_type);
-        let mem = match unsafe { self.device.allocate_memory(&alloc, None) } {
-            Ok(mem) => mem,
-            Err(err) => {
-                unsafe {
-                    libc::close(dup_fd);
-                    self.device.destroy_image(img, None);
-                }
-                return Err(err.into());
-            }
-        };
-        unsafe { self.device.bind_image_memory(img, mem, 0)? };
-
-        debug!("vkbridge: imported staging dmabuf (new cache entry)");
-        let mut state = self.state.lock().unwrap();
-        state.src_key = Some(key);
-        state.src_image = Some((img, mem));
-        Ok(img)
-    }
-
-    /// Import (or reuse the cached import of) a target-owned destination
-    /// dmabuf as a vulkan TRANSFER_DST image. The buffer is allocated by the
-    /// target gpu's allocator (Intel GBM, system RAM) — no export step from
-    /// this gpu is needed at all.
-    fn ensure_dst_import(&self, dst: &Dmabuf, vk_format: vk::Format) -> Result<vk::Image, VkBridgeError> {
-        let (w, h) = (dst.size().w as u32, dst.size().h as u32);
-        let modifier = dst.format().modifier;
-        let fd = dst.handles().next().ok_or(VkBridgeError::Unsupported)?.as_raw_fd();
-
-        {
-            let state = self.state.lock().unwrap();
-            if let Some((img, _)) = state.dst_imports.get(&fd) {
-                return Ok(*img);
-            }
-        }
-
-        let stride = dst.strides().next().ok_or(VkBridgeError::Unsupported)?;
-        let offset = dst.offsets().next().ok_or(VkBridgeError::Unsupported)?;
-        let plane_layout = vk::SubresourceLayout {
-            offset: offset as u64,
-            size: 0,
-            row_pitch: stride as u64,
-            array_pitch: 0,
-            depth_pitch: 0,
-        };
-        let mut mod_create = vk::ImageDrmFormatModifierExplicitCreateInfoEXT {
-            drm_format_modifier: modifier.into(),
-            drm_format_modifier_plane_count: 1,
-            p_plane_layouts: &plane_layout,
-            ..Default::default()
-        };
-        let mut ext_create = vk::ExternalMemoryImageCreateInfo::default()
-            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-        let info = vk::ImageCreateInfo::default()
-            .push_next(&mut mod_create)
-            .push_next(&mut ext_create)
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(vk_format)
-            .extent(vk::Extent3D { width: w, height: h, depth: 1 })
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-            .usage(vk::ImageUsageFlags::TRANSFER_DST
-                | vk::ImageUsageFlags::TRANSFER_SRC
-                | vk::ImageUsageFlags::SAMPLED)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED);
-        let img = unsafe { self.device.create_image(&info, None)? };
-
-        let req = unsafe { self.device.get_image_memory_requirements(img) };
-        let dup_fd = unsafe { libc::dup(fd) };
-        if dup_fd < 0 {
-            unsafe { self.device.destroy_image(img, None) };
-            return Err(VkBridgeError::Setup("failed to dup dst dmabuf fd".into()));
-        }
-        let mut import_info = vk::ImportMemoryFdInfoKHR::default()
-            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-            .fd(dup_fd);
-        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(img);
-        let mem_type = self
-            .mem_type(req.memory_type_bits, vk::MemoryPropertyFlags::empty())
-            .ok_or(VkBridgeError::Setup("no memory type for dst import".into()))?;
-        let alloc = vk::MemoryAllocateInfo::default()
-            .push_next(&mut dedicated)
-            .push_next(&mut import_info)
-            .allocation_size(req.size)
-            .memory_type_index(mem_type);
-        let mem = match unsafe { self.device.allocate_memory(&alloc, None) } {
-            Ok(mem) => mem,
-            Err(err) => {
-                unsafe {
-                    libc::close(dup_fd);
-                    self.device.destroy_image(img, None);
-                }
-                return Err(err.into());
-            }
-        };
-        unsafe { self.device.bind_image_memory(img, mem, 0)? };
-
-        debug!("vkbridge: imported target-owned dst dmabuf fd={fd}");
-        self.state.lock().unwrap().dst_imports.insert(fd, (img, mem));
-        Ok(img)
-    }
-
-    /// GPU-synchronized copy: the copy waits on the render fence (imported as
-    /// a SYNC_FD semaphore — the EGL native fence fd is a sync_file) on the GPU
-    /// timeline, and signals an exportable SYNC_FD semaphore on completion.
-    /// No CPU waits anywhere. Returns the completion semaphore's fd, which the
-    /// consumer imports as an EGLFence for a GPU-side wait before sampling.
-    fn copy_to_linear_synced(
-        &self,
-        src: &Dmabuf,
-        dst: &Dmabuf,
-        wait_fd: Option<std::os::fd::OwnedFd>,
-        regions: &[crate::utils::Rectangle<i32, crate::utils::Buffer>],
-    ) -> Result<std::os::fd::OwnedFd, VkBridgeError> {
-        if src.num_planes() != 1 {
-            return Err(VkBridgeError::Unsupported);
-        }
-        let format = src.format().code;
-        let vk_format = get_vk_format(format).ok_or(VkBridgeError::Unsupported)?;
-        let _ = (src.size(), format);
-
-        let src_img = self.ensure_src_image(src, vk_format)?;
-        let dst_img = self.ensure_dst_import(dst, vk_format)?;
-        self.copy_inner_synced(src, src_img, dst_img, wait_fd, regions)
-    }
-
-    fn copy_inner_synced(
-        &self,
-        src: &Dmabuf,
-        src_img: vk::Image,
-        dst_img: vk::Image,
-        wait_fd: Option<std::os::fd::OwnedFd>,
-        regions: &[crate::utils::Rectangle<i32, crate::utils::Buffer>],
-    ) -> Result<std::os::fd::OwnedFd, VkBridgeError> {
-        // import the render fence as a SYNC_FD semaphore (GPU-side wait)
-        let wait_sem = match wait_fd {
-            Some(fd) => {
-                let sem = unsafe {
-                    self.device
-                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?
-                };
-                let import = vk::ImportSemaphoreFdInfoKHR::default()
-                    .semaphore(sem)
-                    .flags(vk::SemaphoreImportFlags::TEMPORARY)
-                    .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
-                    .fd(fd.into_raw_fd());
-                unsafe { self.get_semaphore_fd.import_semaphore_fd(&import)? };
-                Some(sem)
-            }
-            None => None,
-        };
-
-        // exportable completion semaphore
-        let mut export_sem_info = vk::ExportSemaphoreCreateInfo::default()
-            .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
-        let completion_sem = unsafe {
-            self.device.create_semaphore(
-                &vk::SemaphoreCreateInfo::default().push_next(&mut export_sem_info),
-                None,
-            )?
-        };
-
-        let result = self.copy_inner(src, src_img, dst_img, wait_sem, Some(completion_sem), regions);
-
-        if let Some(sem) = wait_sem {
-            unsafe { self.device.destroy_semaphore(sem, None) };
-        }
-
-        match result {
-            Ok(()) => {
-                // export the completion semaphore's fd (a proper sync_file
-                // that signals when the copy finishes on the gpu timeline)
-                let fd = unsafe {
-                    self.get_semaphore_fd.get_semaphore_fd(
-                        &vk::SemaphoreGetFdInfoKHR::default()
-                            .semaphore(completion_sem)
-                            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
-                    )?
-                };
-                unsafe { self.device.destroy_semaphore(completion_sem, None) };
-                Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
-            }
-            Err(err) => {
-                unsafe { self.device.destroy_semaphore(completion_sem, None) };
-                Err(err)
-            }
-        }
-    }
-
-    fn copy_inner(
-        &self,
-        src: &Dmabuf,
-        src_img: vk::Image,
-        dst_img: vk::Image,
-        wait_sem: Option<vk::Semaphore>,
-        signal_sem: Option<vk::Semaphore>,
-        regions: &[crate::utils::Rectangle<i32, crate::utils::Buffer>],
-    ) -> Result<(), VkBridgeError> {
-        let (w, h) = (src.size().w as u32, src.size().h as u32);
-
-        // record and submit the copy (reusing the pooled command buffer)
-        let cmd = {
-            let mut state = self.state.lock().unwrap();
-            match state.cmd {
-                Some(cmd) => {
-                    unsafe { self.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())? };
-                    cmd
-                }
-                None => {
-                    let cmd = unsafe {
-                        self.device.allocate_command_buffers(
-                            &vk::CommandBufferAllocateInfo::default()
-                                .command_pool(self.cmd_pool)
-                                .level(vk::CommandBufferLevel::PRIMARY)
-                                .command_buffer_count(1),
-                        )?[0]
-                    };
-                    state.cmd = Some(cmd);
-                    cmd
-                }
-            }
-        };
-        let submit_result = (|| -> Result<(), VkBridgeError> {
-            unsafe {
-                self.device.begin_command_buffer(
-                    cmd,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )?;
-                let barriers = [
-                    vk::ImageMemoryBarrier::default()
-                        .src_access_mask(vk::AccessFlags::empty())
-                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                        .old_layout(vk::ImageLayout::UNDEFINED)
-                        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
-                        .dst_queue_family_index(self.queue_family)
-                        .image(src_img)
-                        .subresource_range(vk::ImageSubresourceRange {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            base_mip_level: 0,
-                            level_count: 1,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        }),
-                    vk::ImageMemoryBarrier::default()
-                        .src_access_mask(vk::AccessFlags::empty())
-                        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                        .old_layout(vk::ImageLayout::UNDEFINED)
-                        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_EXTERNAL)
-                        .dst_queue_family_index(self.queue_family)
-                        .image(dst_img)
-                        .subresource_range(vk::ImageSubresourceRange {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            base_mip_level: 0,
-                            level_count: 1,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        }),
-                ];
-                self.device.cmd_pipeline_barrier(
-                    cmd,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &barriers,
-                );
-                let subresource = vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                };
-                let copy_regions: Vec<vk::ImageCopy> = if regions.is_empty() {
-                    vec![vk::ImageCopy::default()
-                        .src_subresource(subresource)
-                        .dst_subresource(subresource)
-                        .extent(vk::Extent3D { width: w, height: h, depth: 1 })]
-                } else {
-                    regions
-                        .iter()
-                        .map(|rect| {
-                            vk::ImageCopy::default()
-                                .src_subresource(subresource)
-                                .src_offset(vk::Offset3D { x: rect.loc.x, y: rect.loc.y, z: 0 })
-                                .dst_subresource(subresource)
-                                .dst_offset(vk::Offset3D { x: rect.loc.x, y: rect.loc.y, z: 0 })
-                                .extent(vk::Extent3D {
-                                    width: rect.size.w as u32,
-                                    height: rect.size.h as u32,
-                                    depth: 1,
-                                })
-                        })
-                        .collect()
-                };
-                self.device.cmd_copy_image(
-                    cmd,
-                    src_img,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    dst_img,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &copy_regions,
-                );
-                self.device.end_command_buffer(cmd)?;
-                let cmds = [cmd];
-                let wait_semaphores: Vec<vk::Semaphore> = wait_sem.into_iter().collect();
-                let signal_semaphores: Vec<vk::Semaphore> = signal_sem.into_iter().collect();
-                let wait_stages = [vk::PipelineStageFlags::TRANSFER];
-                let mut submit = vk::SubmitInfo::default().command_buffers(&cmds);
-                if !wait_semaphores.is_empty() {
-                    submit = submit
-                        .wait_semaphores(&wait_semaphores)
-                        .wait_dst_stage_mask(&wait_stages);
-                }
-                if !signal_semaphores.is_empty() {
-                    submit = submit.signal_semaphores(&signal_semaphores);
-                }
-                self.device.queue_submit(self.queue, &[submit], vk::Fence::null())?;
-                if signal_sem.is_none() {
-                    self.device.queue_wait_idle(self.queue)?;
-                }
-            }
-            Ok(())
-        })();
-
-        submit_result?;
-
-        Ok(())
-    }
-
-    fn mem_type(&self, bits: u32, required: vk::MemoryPropertyFlags) -> Option<u32> {
-        if let Some(&cached) = self.state.lock().unwrap().mem_type_cache.get(&bits) {
-            return Some(cached);
-        }
-        let props = unsafe { self.instance.get_physical_device_memory_properties(self.phd) };
-        let found = (0..props.memory_type_count).find(|&i| {
-            (bits & (1 << i)) != 0
-                && props.memory_types[i as usize].property_flags.contains(required)
-        });
-        if let Some(idx) = found {
-            self.state.lock().unwrap().mem_type_cache.insert(bits, idx);
-        }
-        found
-    }
-}
-
-fn worker_main(
-    core: std::sync::Arc<BridgeCore>,
-    receiver: std::sync::mpsc::Receiver<CopyJob>,
-    latest: std::sync::Arc<std::sync::Mutex<Option<(usize, Dmabuf, std::os::fd::OwnedFd)>>>,
-    copy_seq: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    completed: std::sync::Arc<(std::sync::Mutex<usize>, std::sync::Condvar)>,
-    notifier: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>>,
-) {
-    debug!("vkbridge: copy worker started (GPU-synced)");
-    while let Ok(job) = receiver.recv() {
-        // the copy waits on the render fence on the GPU timeline (imported as
-        // a SYNC_FD semaphore) and signals a completion semaphore on finish —
-        // no CPU waits anywhere
-        match core.copy_to_linear_synced(&job.src, &job.dst, job.wait_fd, &job.regions) {
-            Ok(completion_fd) => {
-                // wait for the copy to ACTUALLY finish on the gpu timeline
-                // (the completion semaphore signals) before unblocking the
-                // compositor — otherwise it re-renders into the staging buffer
-                // while the copy is still in flight, tearing the bottom half
-                let mut pfd = libc::pollfd {
-                    fd: std::os::fd::AsRawFd::as_raw_fd(&completion_fd),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                if unsafe { libc::poll(&mut pfd, 1, 500) } < 0 {
-                    warn!("vkbridge: completion fence poll failed: {}", std::io::Error::last_os_error());
-                    continue;
-                }
-                let seq = copy_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                *latest.lock().unwrap() = Some((seq, job.dst.clone(), completion_fd));
-                if let Some(f) = notifier.lock().unwrap().as_ref() {
-                    f();
-                }
-            }
-            Err(err) => warn!("vkbridge: copy failed: {err}"),
-        }
-        // the staging buffer is fully consumed; unblock the compositor
-        let (lock, cvar) = &*completed;
-        *lock.lock().unwrap() += 1;
-        cvar.notify_all();
-    }
-    debug!("vkbridge: copy worker exiting");
-}
-
-impl VkBridge {
-    /// Create a bridge for the given DRM (render) node.
-    ///
-    /// Returns an error if no matching vulkan physical device exists or device
-    /// creation fails; callers should fall back to the cpu-copy in that case.
-    pub fn new(node: DrmNode) -> Result<Self, VkBridgeError> {
-        Self::init_with(|_vendor, major, minor| major == node.major() as i64 && minor == node.minor() as i64)
-    }
-
-    /// Create a bridge selecting the physical device by PCI vendor id.
-    ///
-    /// `None` picks the first device that is not Intel (0x8086) — i.e. the
-    /// "discrete" gpu on hybrid laptops — falling back to the first device
-    /// with a render node. Used by [`preinit`], where no DRM node is known yet.
-    pub fn new_for_vendor(vendor_id: Option<u32>) -> Result<Self, VkBridgeError> {
-        Self::init_with(|vendor, _major, _minor| match vendor_id {
-            Some(want) => vendor == want,
-            None => vendor != 0x8086,
-        })
-    }
-
-    fn init_with(matcher: impl Fn(u32, i64, i64) -> bool) -> Result<Self, VkBridgeError> {
-        info!("vkbridge: init start");
-        // Prefer the pre-master Preinit (instance already exists); fall back to
-        // creating everything inline for non-preinit flows.
-        let (entry, instance, phd) = match take_preinit() {
-            Some(rx) => match rx.recv() {
-                Ok(Ok(pre)) => {
-                    info!("vkbridge: using pre-master instance");
-                    (pre.entry, pre.instance, pre.phd)
-                }
-                Ok(Err(err)) => return Err(err),
-                Err(_) => return Err(VkBridgeError::Setup("preinit channel closed".into())),
-            },
-            None => {
-                let pre = early_init(None)?;
-                (pre.entry, pre.instance, pre.phd)
-            }
-        };
-
-        // device selection validation against the matcher (when a node is given)
-        {
-            let mut drm_props = vk::PhysicalDeviceDrmPropertiesEXT::default();
-            let mut props =
-                vk::PhysicalDeviceProperties2::default().push_next(&mut drm_props);
-            unsafe { instance.get_physical_device_properties2(phd, &mut props) };
-            let vendor_id = props.properties.vendor_id;
-            if drm_props.has_render == vk::TRUE
-                && !matcher(vendor_id, drm_props.render_major, drm_props.render_minor)
-            {
-                return Err(VkBridgeError::Setup(
-                    "preinited physical device does not match render node".into(),
-                ));
-            }
-        }
-
-        let queue_families = unsafe { instance.get_physical_device_queue_family_properties(phd) };
-        let queue_family = queue_families
-            .iter()
-            .position(|p| p.queue_flags.contains(vk::QueueFlags::TRANSFER))
-            .or_else(|| {
-                queue_families
-                    .iter()
-                    .position(|p| p.queue_flags.contains(vk::QueueFlags::GRAPHICS))
-            })
-            .ok_or_else(|| VkBridgeError::Setup("no transfer/graphics queue".into()))?
-            as u32;
-
-        let priorities = [1.0f32];
-        let queue_info = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(queue_family)
-            .queue_priorities(&priorities)];
-        let device_extensions = [
-            ext::image_drm_format_modifier::NAME.as_ptr(),
-            ext::external_memory_dma_buf::NAME.as_ptr(),
-            khr::external_memory_fd::NAME.as_ptr(),
-            khr::external_semaphore::NAME.as_ptr(),
-            khr::external_semaphore_fd::NAME.as_ptr(),
-        ];
-        let device = unsafe {
-            instance.create_device(
-                phd,
-                &vk::DeviceCreateInfo::default()
-                    .queue_create_infos(&queue_info)
-                    .enabled_extension_names(&device_extensions),
-                None,
-            )
-        }?;
-        info!("vkbridge: device created");
-        let queue = unsafe { device.get_device_queue(queue_family, 0) };
-        let cmd_pool = unsafe {
-            device.create_command_pool(
-                &vk::CommandPoolCreateInfo::default()
-                    .queue_family_index(queue_family)
-                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
-                None,
-            )
-        }?;
-        info!("vkbridge: queue + cmd pool ok");
-        let get_semaphore_fd = khr::external_semaphore_fd::Device::new(&instance, &device);
-
-        info!("vkbridge: initialized");
-        let core = std::sync::Arc::new(BridgeCore {
-            entry,
-            instance,
-            phd,
-            device,
-            queue,
-            queue_family,
-            cmd_pool,
-            get_semaphore_fd,
-            state: std::sync::Mutex::new(CopyState::default()),
-        });
-        let (sender, receiver) = std::sync::mpsc::sync_channel::<CopyJob>(2);
-        let latest = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let copy_seq = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let submitted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let completed = std::sync::Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new()));
-        let completion_notifier =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
-        let worker_notifier = completion_notifier.clone();
-        let worker = {
-            let core = core.clone();
-            let latest = latest.clone();
-            let copy_seq = copy_seq.clone();
-            let completed = completed.clone();
-            std::thread::Builder::new()
-                .name("vkbridge-copy".into())
-                .spawn(move || {
-                    worker_main(core, receiver, latest, copy_seq, completed, worker_notifier)
-                })
-                .map_err(|err| VkBridgeError::Setup(format!("failed to spawn copy worker: {err}")))?
-        };
-        Ok(VkBridge {
-            _core: core,
-            sender,
-            latest,
-            _copy_seq: copy_seq,
-            last_presented: std::sync::atomic::AtomicUsize::new(0),
-            // share the SAME Arc the worker holds, so set_completion_notifier
-            // updates reach the worker (a fresh Arc here would never propagate)
-            completion_notifier,
-            submitted,
-            completed,
-            worker: Some(worker),
-        })
-    }
-
-    /// Queue a copy of `src` to linear. Returns immediately; the result is
-    /// available via [`VkBridge::latest_completed`] once the worker finishes it
-    /// (typically next frame). The job's sync point is awaited on the worker
-    /// thread, never on the compositor.
-    pub fn submit_copy(
-        &self,
-        src: Dmabuf,
-        dst: Dmabuf,
-        sync: crate::backend::renderer::sync::SyncPoint,
-        regions: Vec<crate::utils::Rectangle<i32, crate::utils::Buffer>>,
-    ) {
-        let wait_fd = sync.export();
-        self.submitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if self
-            .sender
-            .try_send(CopyJob {
-                src,
-                dst,
-                _sync: sync,
-                wait_fd,
-                regions,
-            })
-            .is_err()
-        {
-            debug!("vkbridge: copy queue full, skipping frame copy");
-        }
-    }
-
-    /// Block until all submitted copies have completed. Called before the
-    /// compositor re-renders into the staging buffer, so the copy worker is
-    /// never reading it concurrently. Usually a no-op: the worker finishes a
-    /// copy in ~1ms, long before the next frame starts rendering.
-    pub fn wait_for_pending_copies(&self) {
-        let submitted = self.submitted.load(std::sync::atomic::Ordering::SeqCst);
-        let (lock, cvar) = &*self.completed;
-        let mut completed = lock.lock().unwrap();
-        while *completed < submitted {
-            completed = cvar.wait(completed).unwrap();
-        }
-    }
-
-    /// The most recent completed copy as (sequence, dmabuf, dup of the
-    /// completion sync fd. The slot keeps the original fd until a newer copy
-    /// replaces it.
-    pub fn latest_completed(&self) -> Option<(usize, Dmabuf, std::os::fd::OwnedFd)> {
-        let slot = self.latest.lock().unwrap();
-        slot.as_ref().and_then(|(seq, dmabuf, fd)| {
-            let dup = unsafe { libc::dup(std::os::fd::AsRawFd::as_raw_fd(fd)) };
-            (dup >= 0).then(|| (*seq, dmabuf.clone(), unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) }))
-        })
-    }
-
-    /// The latest completed copy only if it is newer than `last_seq`
-    /// (used to present each copy exactly once).
-    pub fn completed_newer_than(
-        &self,
-        last_seq: usize,
-    ) -> Option<(usize, Dmabuf, std::os::fd::OwnedFd)> {
-        let slot = self.latest.lock().unwrap();
-        slot.as_ref().and_then(|(seq, dmabuf, fd)| {
-            if *seq > last_seq {
-                let dup = unsafe { libc::dup(std::os::fd::AsRawFd::as_raw_fd(fd)) };
-                (dup >= 0).then(|| (*seq, dmabuf.clone(), unsafe { std::os::fd::OwnedFd::from_raw_fd(dup) }))
-            } else {
-                None
-            }
-        })
-    }
-
-    /// Set the callback invoked whenever a copy completes.
-    pub fn set_completion_notifier(&self, f: std::sync::Arc<dyn Fn() + Send + Sync>) {
-        *self.completion_notifier.lock().unwrap() = Some(f);
-    }
-
-    /// The sequence of the last completed copy that was presented.
-    pub fn last_presented_seq(&self) -> usize {
-        self.last_presented.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Record that a completed copy has been presented.
-    pub fn mark_presented(&self, seq: usize) {
-        self.last_presented
-            .store(seq, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-impl Drop for VkBridge {
+impl Drop for Resources {
     fn drop(&mut self) {
-        // Detach the worker (drop the join handle) instead of joining it:
-        // the worker blocks in recv() and the channel never closes while we
-        // hold a sender, so joining would deadlock the compositor's shutdown.
-        // The bridge only drops at compositor exit, where the process
-        // teardown reaps the thread anyway.
-        drop(self.worker.take());
+        unsafe {
+            for sem in self.semaphores.drain(..) {
+                self.core.device.destroy_semaphore(sem, None);
+            }
+            self.core.device.destroy_fence(self.fence, None);
+            self.core.device.destroy_command_pool(self.pool, None);
+        }
     }
+}
+
+struct Batch {
+    resources: Option<Resources>,
+    submitted: bool,
+}
+
+impl Batch {
+    fn resources(&self) -> &Resources {
+        self.resources.as_ref().unwrap()
+    }
+
+    fn complete(&self) -> Result<bool, vk::Result> {
+        let r = self.resources();
+        unsafe { r.core.device.get_fence_status(r.fence) }
+    }
+
+    fn wait(&self) -> Result<(), vk::Result> {
+        let r = self.resources();
+        unsafe { r.core.device.wait_for_fences(&[r.fence], true, u64::MAX) }
+    }
+}
+
+impl Drop for Batch {
+    fn drop(&mut self) {
+        if self.submitted {
+            match self.wait() {
+                Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => {}
+                Err(err) => {
+                    // An unexpected host-side wait failure is NOT completion. Leak the whole
+                    // ownership tree rather than free resources the GPU might still access.
+                    warn!(?err, "Vulkan retirement wait failed; retaining batch for safety");
+                    std::mem::forget(self.resources.take());
+                }
+            }
+        }
+    }
+}
+
+struct TransferFence {
+    batch: Arc<Batch>,
+    fd: Option<OwnedFd>,
+}
+
+impl std::fmt::Debug for TransferFence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VulkanTransferFence")
+            .field("exportable", &self.fd.is_some())
+            .finish()
+    }
+}
+
+impl Fence for TransferFence {
+    fn is_signaled(&self) -> bool {
+        matches!(
+            self.batch.complete(),
+            Ok(true) | Err(vk::Result::ERROR_DEVICE_LOST)
+        )
+    }
+    fn wait(&self) -> Result<(), Interrupted> {
+        retirement_wait(self.batch.wait())
+    }
+    fn is_exportable(&self) -> bool {
+        self.fd.is_some()
+    }
+    fn export(&self) -> Option<OwnedFd> {
+        self.fd.as_ref()?.try_clone().ok()
+    }
+}
+
+fn retirement_wait(result: Result<(), vk::Result>) -> Result<(), Interrupted> {
+    match result {
+        // Device loss retires resource access, but does NOT make pixels valid.
+        // The engine keeps reporting the raw device-loss error from copy().
+        Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => Ok(()),
+        Err(_) => Err(Interrupted),
+    }
+}
+
+const MAX_IMPORTS: usize = 8;
+const MAX_PENDING: usize = 8;
+const MAX_MODIFIER_QUERIES: usize = 8;
+
+struct SourceModifiers {
+    fourcc: Fourcc,
+    width: u32,
+    height: u32,
+    modifiers: Vec<Modifier>,
+}
+
+/// Transfer-only engine; allocations and presentation state belong to the caller.
+/// Dropping the engine or its last outstanding fence may wait for GPU retirement.
+pub struct VkBridge {
+    core: Arc<Core>,
+    imports: VecDeque<Arc<Imported>>,
+    pending: Vec<Arc<Batch>>,
+    source_modifiers: VecDeque<SourceModifiers>,
 }
 
 impl std::fmt::Debug for VkBridge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VkBridge").finish_non_exhaustive()
+        f.debug_struct("VkBridge")
+            .field("pending", &self.pending.len())
+            .finish_non_exhaustive()
     }
 }
 
-/// A native fence fd wrapped as a smithay [`Fence`](crate::backend::renderer::sync::Fence),
-/// letting consumers wait on a vulkan-produced fence through the usual
-/// [`SyncPoint`](crate::backend::renderer::sync::SyncPoint) paths (including
-/// server-side waits after EGL import).
-#[derive(Debug)]
-pub struct NativeFdFence(std::os::fd::OwnedFd);
-
-impl NativeFdFence {
-    /// Wrap an owned native fence fd.
-    pub fn new(fd: std::os::fd::OwnedFd) -> Self {
-        Self(fd)
-    }
-}
-
-impl crate::backend::renderer::sync::Fence for NativeFdFence {
-    fn is_signaled(&self) -> bool {
-        let mut pfd = libc::pollfd {
-            fd: std::os::fd::AsRawFd::as_raw_fd(&self.0),
-            events: libc::POLLIN,
-            revents: 0,
+impl VkBridge {
+    /// Create the logical device on exactly `node`, consuming preinitialization if available.
+    pub fn new(node: DrmNode) -> Result<Self, VkBridgeError> {
+        let receiver = PREINIT.lock().unwrap().take();
+        let init = match receiver {
+            Some(rx) => rx
+                .recv()
+                .map_err(|_| VkBridgeError::Setup("preinit channel closed".into()))??,
+            None => early_init(None)?,
         };
-        unsafe { libc::poll(&mut pfd, 1, 0) > 0 }
-    }
-
-    fn wait(&self) -> Result<(), crate::backend::renderer::sync::Interrupted> {
-        let mut pfd = libc::pollfd {
-            fd: std::os::fd::AsRawFd::as_raw_fd(&self.0),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        if unsafe { libc::poll(&mut pfd, 1, -1) } < 0 {
-            return Err(crate::backend::renderer::sync::Interrupted);
+        let mut devices = unsafe { init.instance.enumerate_physical_devices() }?;
+        devices.sort_by_key(|&phd| {
+            let props = unsafe { init.instance.get_physical_device_properties(phd) };
+            init.preferred.is_some_and(|v| v != props.vendor_id)
+        });
+        let required = [
+            ext::physical_device_drm::NAME,
+            ext::image_drm_format_modifier::NAME,
+            ext::external_memory_dma_buf::NAME,
+            ext::queue_family_foreign::NAME,
+            khr::external_memory_fd::NAME,
+        ];
+        let mut selected = None;
+        for phd in devices {
+            let extensions = unsafe { init.instance.enumerate_device_extension_properties(phd) }?;
+            let supports = |name: &CStr| {
+                extensions
+                    .iter()
+                    .any(|p| unsafe { CStr::from_ptr(p.extension_name.as_ptr()) == name })
+            };
+            if !required.iter().all(|name| supports(name)) {
+                continue;
+            }
+            let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
+            let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
+            unsafe { init.instance.get_physical_device_properties2(phd, &mut props) };
+            if props.properties.api_version < vk::API_VERSION_1_2 {
+                continue;
+            }
+            if drm.has_render == vk::TRUE
+                && drm.render_major == node.major() as i64
+                && drm.render_minor == node.minor() as i64
+            {
+                selected = Some((phd, supports(khr::external_semaphore_fd::NAME)));
+                break;
+            }
         }
-        Ok(())
+        let (phd, semaphore_extension) = selected.ok_or_else(|| {
+            VkBridgeError::Setup(
+                "no matching Vulkan 1.2 render node with explicit dma-buf/foreign ownership support".into(),
+            )
+        })?;
+        // Graphics queues have unrestricted image-transfer granularity. Dedicated transfer
+        // queues may require whole mip levels or aligned regions, incompatible with damage.
+        let families = unsafe { init.instance.get_physical_device_queue_family_properties(phd) };
+        let family = families
+            .iter()
+            .position(|p| p.queue_count > 0 && p.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+            .ok_or_else(|| VkBridgeError::Setup("no graphics transfer queue".into()))?
+            as u32;
+        let mut semaphore_props = vk::ExternalSemaphoreProperties::default();
+        if semaphore_extension {
+            unsafe {
+                init.instance.get_physical_device_external_semaphore_properties(
+                    phd,
+                    &vk::PhysicalDeviceExternalSemaphoreInfo::default()
+                        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
+                    &mut semaphore_props,
+                )
+            };
+        }
+        let priorities = [1.0];
+        let queues = [vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(family)
+            .queue_priorities(&priorities)];
+        let mut names: Vec<_> = required.iter().map(|n| n.as_ptr()).collect();
+        if semaphore_extension {
+            names.push(khr::external_semaphore_fd::NAME.as_ptr());
+        }
+        let device = unsafe {
+            init.instance.create_device(
+                phd,
+                &vk::DeviceCreateInfo::default()
+                    .queue_create_infos(&queues)
+                    .enabled_extension_names(&names),
+                None,
+            )
+        }?;
+        // All operations after device creation are infallible until ownership reaches Core.
+        let queue = unsafe { device.get_device_queue(family, 0) };
+        let memory_fd = khr::external_memory_fd::Device::new(&init.instance, &device);
+        let semaphore_fd =
+            semaphore_extension.then(|| khr::external_semaphore_fd::Device::new(&init.instance, &device));
+        let features = semaphore_props.external_semaphore_features;
+        Ok(Self {
+            core: Arc::new(Core {
+                init,
+                phd,
+                device,
+                queue,
+                family,
+                memory_fd,
+                semaphore_fd,
+                import_sync_fd: features.contains(vk::ExternalSemaphoreFeatureFlags::IMPORTABLE),
+                export_sync_fd: features.contains(vk::ExternalSemaphoreFeatureFlags::EXPORTABLE),
+            }),
+            imports: VecDeque::new(),
+            pending: Vec::new(),
+            source_modifiers: VecDeque::new(),
+        })
     }
 
-    fn is_exportable(&self) -> bool {
-        true
+    /// Enumerate source modifiers this engine can import for an exact format and size.
+    ///
+    /// Only explicit single-plane modifiers supporting `TRANSFER_SRC` and DMA_BUF import
+    /// are returned. Intersect these with the source EGL render formats BEFORE allocating
+    /// the source; a GPU's native GBM modifier is not necessarily Vulkan-importable.
+    /// The result is numerically sorted, not a performance preference. An empty result means
+    /// no supported combination. Unknown FourCCs and zero/non-i32 dimensions are errors.
+    ///
+    /// Up to eight FourCC/size queries (including empty results) are cached. Negotiation does
+    /// not guarantee a particular allocation can be imported: actual fd memory types, plane
+    /// layout and descriptor compatibility are still validated by [`Self::copy`].
+    pub fn source_modifiers(
+        &mut self,
+        fourcc: Fourcc,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<Modifier>, VkBridgeError> {
+        if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
+            return Err(VkBridgeError::Unsupported(
+                "invalid source modifier query dimensions",
+            ));
+        }
+        let format = get_vk_format(fourcc).ok_or(VkBridgeError::Unsupported("unknown FourCC"))?;
+        if let Some(index) = self
+            .source_modifiers
+            .iter()
+            .position(|entry| entry.fourcc == fourcc && entry.width == width && entry.height == height)
+        {
+            let entry = self.source_modifiers.remove(index).unwrap();
+            let result = entry.modifiers.clone();
+            self.source_modifiers.push_back(entry);
+            return Ok(result);
+        }
+        let mut modifiers = Vec::new();
+        for candidate in self.core.modifier_properties(format) {
+            if !single_plane_transfer(&candidate, true) {
+                continue;
+            }
+            if let Some(limits) = self.core.import_properties(
+                format,
+                candidate.drm_format_modifier,
+                vk::ImageUsageFlags::TRANSFER_SRC,
+            )? {
+                if fits_image(&limits, width, height) {
+                    modifiers.push(Modifier::from(candidate.drm_format_modifier));
+                }
+            }
+        }
+        modifiers.sort_by_key(|&modifier| u64::from(modifier));
+        modifiers.dedup();
+        if self.source_modifiers.len() == MAX_MODIFIER_QUERIES {
+            self.source_modifiers.pop_front();
+        }
+        self.source_modifiers.push_back(SourceModifiers {
+            fourcc,
+            width,
+            height,
+            modifiers: modifiers.clone(),
+        });
+        Ok(modifiers)
     }
 
-    fn export(&self) -> Option<std::os::fd::OwnedFd> {
-        let fd = unsafe { libc::dup(std::os::fd::AsRawFd::as_raw_fd(&self.0)) };
-        (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    /// Submit this frame's regions and return a fence for that exact submission.
+    ///
+    /// Input fences are imported as temporary SYNC_FD semaphore payloads when possible;
+    /// otherwise they are explicitly CPU-waited. Copy completion is never CPU-waited here.
+    /// A failed native completion export still returns a valid, nonexportable Vulkan fence.
+    /// `src` and `dst` must be distinct, non-aliasing allocations with matching dimensions,
+    /// FourCC and orientation. Only explicit single-plane modifiers are supported.
+    pub fn copy(
+        &mut self,
+        src: &Dmabuf,
+        dst: &Dmabuf,
+        acquire: &SyncPoint,
+        destination_release: Option<&SyncPoint>,
+        regions: &[Rectangle<i32, Buffer>],
+    ) -> Result<SyncPoint, VkBridgeError> {
+        let format = validate(src, dst, regions)?;
+        // Device loss is a real error, not a successfully completed frame.
+        for batch in &self.pending {
+            batch.complete()?;
+        }
+        self.pending.retain(|batch| !batch.complete().unwrap_or(false));
+        if self.pending.len() >= MAX_PENDING {
+            return Err(VkBridgeError::Busy);
+        }
+        let source = self.import(src, format, true)?;
+        let destination = self.import(dst, format, false)?;
+        let mut batch = Batch {
+            submitted: false,
+            resources: Some(Resources {
+                core: self.core.clone(),
+                _images: [source, destination],
+                // Imported SYNC_FD payloads own their dependency. CPU-waited inputs
+                // have retired. Retaining SyncPoints here would make fence chains
+                // retain every earlier batch, defeating bounded retirement.
+                pool: vk::CommandPool::null(),
+                fence: vk::Fence::null(),
+                semaphores: Vec::new(),
+            }),
+        };
+        let r = batch.resources.as_mut().unwrap();
+        let device = &self.core.device;
+        r.pool = unsafe {
+            device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default().queue_family_index(self.core.family),
+                None,
+            )
+        }?;
+        r.fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }?;
+        let mut waits = Vec::new();
+        for input in std::iter::once(acquire).chain(destination_release) {
+            if !input.contains_fence() {
+                continue;
+            }
+            let mut imported = false;
+            if self.core.import_sync_fd {
+                if let Some(fd) = input.export() {
+                    let sem = unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?;
+                    r.semaphores.push(sem);
+                    let info = vk::ImportSemaphoreFdInfoKHR::default()
+                        .semaphore(sem)
+                        .flags(vk::SemaphoreImportFlags::TEMPORARY)
+                        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+                        .fd(fd.as_raw_fd());
+                    if unsafe {
+                        self.core
+                            .semaphore_fd
+                            .as_ref()
+                            .unwrap()
+                            .import_semaphore_fd(&info)
+                    }
+                    .is_ok()
+                    {
+                        // Vulkan owns the descriptor only after a successful import.
+                        let _ = fd.into_raw_fd();
+                        waits.push(sem);
+                        imported = true;
+                    }
+                }
+            }
+            if !imported {
+                input.wait()?;
+            }
+        }
+        let mut signals = Vec::new();
+        if self.core.export_sync_fd {
+            let mut export = vk::ExportSemaphoreCreateInfo::default()
+                .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+            let sem = unsafe {
+                device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut export), None)
+            }?;
+            r.semaphores.push(sem);
+            signals.push(sem);
+        }
+        let command = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(r.pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }?[0];
+        record(
+            &self.core,
+            command,
+            r._images[0].image,
+            r._images[1].image,
+            regions,
+        )?;
+        let commands = [command];
+        let stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; waits.len()];
+        let submit = vk::SubmitInfo::default()
+            .command_buffers(&commands)
+            .wait_semaphores(&waits)
+            .wait_dst_stage_mask(&stages)
+            .signal_semaphores(&signals);
+        unsafe { device.queue_submit(self.core.queue, &[submit], r.fence) }?;
+        batch.submitted = true;
+        // From this point there must be no fallible early return: caller must receive the
+        // source-release fence even when native fd export fails after successful submission.
+        let fd = signals.first().and_then(|&sem| {
+            let info = vk::SemaphoreGetFdInfoKHR::default()
+                .semaphore(sem)
+                .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+            match unsafe { self.core.semaphore_fd.as_ref().unwrap().get_semaphore_fd(&info) } {
+                Ok(fd) if fd >= 0 => Some(unsafe { OwnedFd::from_raw_fd(fd) }),
+                // -1 denotes an already-signaled payload. Keep using VkFence for retirement.
+                Ok(_) => None,
+                Err(err) => {
+                    warn!(?err, "native copy fence export failed; using Vulkan wait");
+                    None
+                }
+            }
+        });
+        let batch = Arc::new(batch);
+        self.pending.push(batch.clone());
+        Ok(TransferFence { batch, fd }.into())
+    }
+
+    fn import(
+        &mut self,
+        dmabuf: &Dmabuf,
+        format: vk::Format,
+        source: bool,
+    ) -> Result<Arc<Imported>, VkBridgeError> {
+        if let Some(index) = self
+            .imports
+            .iter()
+            .position(|i| i.dmabuf == *dmabuf && i.source == source)
+        {
+            let image = self.imports.remove(index).unwrap();
+            self.imports.push_back(image.clone());
+            return Ok(image);
+        }
+        let core = &self.core;
+        let usage = if source {
+            vk::ImageUsageFlags::TRANSFER_SRC
+        } else {
+            vk::ImageUsageFlags::TRANSFER_DST
+        };
+        let modifier = u64::from(dmabuf.format().modifier);
+        // Use the same exact modifier/usage/importability checks as allocation negotiation.
+        let modifiers = core.modifier_properties(format);
+        if !modifiers
+            .iter()
+            .any(|m| m.drm_format_modifier == modifier && single_plane_transfer(m, source))
+        {
+            tracing::debug!(source, ?format, modifier, available = ?modifiers.iter().map(|m| (m.drm_format_modifier, m.drm_format_modifier_plane_count)).collect::<Vec<_>>(), "Vulkan DMA-BUF modifier rejected");
+            return Err(VkBridgeError::Unsupported(
+                "modifier is unsupported, has auxiliary planes or lacks transfer support",
+            ));
+        }
+        let limits = core
+            .import_properties(format, modifier, usage)?
+            .ok_or(VkBridgeError::Unsupported("image is not importable"))?;
+        if !fits_image(&limits, dmabuf.size().w as u32, dmabuf.size().h as u32) {
+            return Err(VkBridgeError::Unsupported("image is not importable at this size"));
+        }
+        let layouts = [vk::SubresourceLayout {
+            offset: dmabuf.offsets().next().unwrap() as u64,
+            row_pitch: dmabuf.strides().next().unwrap() as u64,
+            ..Default::default()
+        }];
+        let mut explicit = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+            .drm_format_modifier(modifier)
+            .plane_layouts(&layouts);
+        let mut external = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let info = vk::ImageCreateInfo::default()
+            .push_next(&mut explicit)
+            .push_next(&mut external)
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: dmabuf.size().w as u32,
+                height: dmabuf.size().h as u32,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        // Establish RAII immediately, before any subsequent driver call can fail.
+        let mut image = Imported {
+            core: core.clone(),
+            dmabuf: dmabuf.clone(),
+            source,
+            image: vk::Image::null(),
+            memory: vk::DeviceMemory::null(),
+        };
+        image.image = unsafe { core.device.create_image(&info, None) }?;
+        let req = unsafe { core.device.get_image_memory_requirements(image.image) };
+        let fd = dmabuf.handles().next().unwrap().try_clone_to_owned()?;
+        let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+        unsafe {
+            core.memory_fd.get_memory_fd_properties(
+                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                fd.as_raw_fd(),
+                &mut fd_props,
+            )
+        }?;
+        let bits = req.memory_type_bits & fd_props.memory_type_bits;
+        let memory_type = select_memory_type(bits).ok_or(VkBridgeError::Unsupported(
+            "no common memory type for dma-buf and image",
+        ))?;
+        let mut import = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+            .fd(fd.as_raw_fd());
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image.image);
+        let allocation = vk::MemoryAllocateInfo::default()
+            .allocation_size(req.size)
+            .memory_type_index(memory_type)
+            .push_next(&mut import)
+            .push_next(&mut dedicated);
+        image.memory = unsafe { core.device.allocate_memory(&allocation, None) }?;
+        let _ = fd.into_raw_fd();
+        unsafe { core.device.bind_image_memory(image.image, image.memory, 0) }?;
+        let image = Arc::new(image);
+        if self.imports.len() == MAX_IMPORTS {
+            self.imports.pop_front();
+        }
+        self.imports.push_back(image.clone());
+        Ok(image)
+    }
+}
+
+fn single_plane_transfer(modifier: &vk::DrmFormatModifierPropertiesEXT, source: bool) -> bool {
+    let required = if source {
+        vk::FormatFeatureFlags::TRANSFER_SRC
+    } else {
+        vk::FormatFeatureFlags::TRANSFER_DST
+    };
+    Modifier::from(modifier.drm_format_modifier) != Modifier::Invalid
+        && modifier.drm_format_modifier_plane_count == 1
+        && modifier.drm_format_modifier_tiling_features.contains(required)
+}
+
+fn fits_image(limits: &vk::ImageFormatProperties, width: u32, height: u32) -> bool {
+    width > 0
+        && height > 0
+        && width <= limits.max_extent.width
+        && height <= limits.max_extent.height
+        && limits.max_extent.depth >= 1
+        && limits.max_mip_levels >= 1
+        && limits.max_array_layers >= 1
+        && limits.sample_counts.contains(vk::SampleCountFlags::TYPE_1)
+}
+
+fn select_memory_type(bits: u32) -> Option<u32> {
+    (bits != 0).then(|| bits.trailing_zeros())
+}
+
+fn valid_region(width: i32, height: i32, rect: &Rectangle<i32, Buffer>) -> bool {
+    rect.loc.x >= 0
+        && rect.loc.y >= 0
+        && rect.size.w > 0
+        && rect.size.h > 0
+        && rect.loc.x.checked_add(rect.size.w).is_some_and(|x| x <= width)
+        && rect.loc.y.checked_add(rect.size.h).is_some_and(|y| y <= height)
+}
+
+fn valid_descriptor(width: i32, height: i32, planes: usize, modifier: Modifier, stride: u32) -> bool {
+    // All currently mapped Vulkan formats are uncompressed four-byte pixels. Tiled
+    // modifiers have opaque pitch rules; explicit layouts are additionally driver-validated.
+    width > 0
+        && height > 0
+        && planes == 1
+        && modifier != Modifier::Invalid
+        && stride > 0
+        && (modifier != Modifier::Linear || u64::from(stride) >= width as u64 * 4)
+}
+
+fn validate(
+    src: &Dmabuf,
+    dst: &Dmabuf,
+    regions: &[Rectangle<i32, Buffer>],
+) -> Result<vk::Format, VkBridgeError> {
+    if src == dst {
+        return Err(VkBridgeError::Unsupported("source aliases destination"));
+    }
+    if src.size() != dst.size()
+        || src.format().code != dst.format().code
+        || src.y_inverted() != dst.y_inverted()
+    {
+        return Err(VkBridgeError::Unsupported("size, FourCC or orientation mismatch"));
+    }
+    for buffer in [src, dst] {
+        if !valid_descriptor(
+            buffer.size().w,
+            buffer.size().h,
+            buffer.num_planes(),
+            buffer.format().modifier,
+            buffer.strides().next().unwrap_or(0),
+        ) || buffer
+            .flags()
+            .intersects(DmabufFlags::INTERLACED | DmabufFlags::BOTTOM_FIRST)
+        {
+            return Err(VkBridgeError::Unsupported("invalid single-plane descriptor"));
+        }
+    }
+    // Distinct Dmabuf wrappers can still contain dup'd descriptors for one allocation.
+    // Identity is used for caching; kernel identity is additionally checked for aliasing.
+    let identity = |buffer: &Dmabuf| -> Result<_, std::io::Error> {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let fd = buffer.handles().next().unwrap();
+        if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let stat = unsafe { stat.assume_init() };
+        Ok((stat.st_dev, stat.st_ino))
+    };
+    if identity(src)? == identity(dst)? {
+        return Err(VkBridgeError::Unsupported(
+            "source and destination share an allocation",
+        ));
+    }
+    if regions.is_empty()
+        || !regions
+            .iter()
+            .all(|r| valid_region(src.size().w, src.size().h, r))
+    {
+        return Err(VkBridgeError::Unsupported("empty or out-of-bounds damage"));
+    }
+    get_vk_format(src.format().code).ok_or(VkBridgeError::Unsupported("unknown FourCC"))
+}
+
+fn record(
+    core: &Core,
+    cmd: vk::CommandBuffer,
+    src: vk::Image,
+    dst: vk::Image,
+    regions: &[Rectangle<i32, Buffer>],
+) -> Result<(), VkBridgeError> {
+    let range = vk::ImageSubresourceRange::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .level_count(1)
+        .layer_count(1);
+    let specs = [
+        (
+            src,
+            vk::AccessFlags::TRANSFER_READ,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        ),
+        (
+            dst,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        ),
+    ];
+    let acquire: Vec<_> = specs
+        .iter()
+        .map(|&(image, access, layout)| {
+            vk::ImageMemoryBarrier::default()
+                .image(image)
+                .subresource_range(range)
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(access)
+                // Never discard source contents (or untouched destination damage) with UNDEFINED.
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(layout)
+                .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                .dst_queue_family_index(core.family)
+        })
+        .collect();
+    let release: Vec<_> = specs
+        .iter()
+        .map(|&(image, access, layout)| {
+            vk::ImageMemoryBarrier::default()
+                .image(image)
+                .subresource_range(range)
+                .src_access_mask(access)
+                .dst_access_mask(vk::AccessFlags::empty())
+                .old_layout(layout)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(core.family)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+        })
+        .collect();
+    let layers = vk::ImageSubresourceLayers::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .layer_count(1);
+    unsafe {
+        core.device.begin_command_buffer(
+            cmd,
+            &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        )?;
+        core.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &acquire,
+        );
+        // Separate commands permit overlapping damage rectangles without violating the
+        // non-overlap rule for a single vkCmdCopyImage region array. Serialize their writes.
+        for (index, rect) in regions.iter().enumerate() {
+            if index != 0 {
+                let barrier = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+                core.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[barrier],
+                    &[],
+                    &[],
+                );
+            }
+            let offset = vk::Offset3D {
+                x: rect.loc.x,
+                y: rect.loc.y,
+                z: 0,
+            };
+            let region = vk::ImageCopy::default()
+                .src_subresource(layers)
+                .dst_subresource(layers)
+                .src_offset(offset)
+                .dst_offset(offset)
+                .extent(vk::Extent3D {
+                    width: rect.size.w as u32,
+                    height: rect.size.h as u32,
+                    depth: 1,
+                });
+            core.device.cmd_copy_image(
+                cmd,
+                src,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                dst,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+        }
+        core.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &release,
+        );
+        core.device.end_command_buffer(cmd)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modifier_negotiation_requires_explicit_single_plane_and_exact_usage() {
+        let mut modifier = vk::DrmFormatModifierPropertiesEXT {
+            drm_format_modifier: u64::from(Modifier::Linear),
+            drm_format_modifier_plane_count: 1,
+            drm_format_modifier_tiling_features: vk::FormatFeatureFlags::TRANSFER_SRC,
+        };
+        assert!(single_plane_transfer(&modifier, true));
+        assert!(!single_plane_transfer(&modifier, false));
+        modifier.drm_format_modifier_tiling_features = vk::FormatFeatureFlags::TRANSFER_DST;
+        assert!(!single_plane_transfer(&modifier, true));
+        assert!(single_plane_transfer(&modifier, false));
+        modifier.drm_format_modifier_plane_count = 2;
+        assert!(!single_plane_transfer(&modifier, false));
+        modifier.drm_format_modifier_plane_count = 1;
+        modifier.drm_format_modifier = u64::from(Modifier::Invalid);
+        assert!(!single_plane_transfer(&modifier, false));
+    }
+
+    #[test]
+    fn modifier_negotiation_checks_exact_extent_and_image_shape() {
+        let mut limits = vk::ImageFormatProperties {
+            max_extent: vk::Extent3D {
+                width: 256,
+                height: 160,
+                depth: 1,
+            },
+            max_mip_levels: 1,
+            max_array_layers: 1,
+            sample_counts: vk::SampleCountFlags::TYPE_1,
+            ..Default::default()
+        };
+        assert!(fits_image(&limits, 256, 160));
+        assert!(fits_image(&limits, 1, 1));
+        assert!(!fits_image(&limits, 257, 160));
+        assert!(!fits_image(&limits, 256, 161));
+        assert!(!fits_image(&limits, 0, 160));
+        assert!(!fits_image(&limits, 256, 0));
+        limits.sample_counts = vk::SampleCountFlags::TYPE_4;
+        assert!(!fits_image(&limits, 256, 160));
+        limits.sample_counts = vk::SampleCountFlags::TYPE_1;
+        limits.max_array_layers = 0;
+        assert!(!fits_image(&limits, 256, 160));
+    }
+
+    #[test]
+    fn device_loss_retires_fences_but_remains_a_transfer_error() {
+        assert!(retirement_wait(Ok(())).is_ok());
+        assert!(retirement_wait(Err(vk::Result::ERROR_DEVICE_LOST)).is_ok());
+        assert!(retirement_wait(Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY)).is_err());
+        assert!(VkBridgeError::Vk(vk::Result::ERROR_DEVICE_LOST).is_device_lost());
+        assert!(!VkBridgeError::Busy.is_device_lost());
+    }
+
+    #[test]
+    fn region_edges_and_overflow() {
+        let rect = |x, y, w, h| {
+            // Size's constructor rejects negatives before our validator sees them.
+            let mut rect = Rectangle::<i32, Buffer>::new((x, y).into(), (0, 0).into());
+            rect.size.w = w;
+            rect.size.h = h;
+            rect
+        };
+        assert!(valid_region(100, 50, &rect(0, 0, 100, 50)));
+        assert!(valid_region(100, 50, &rect(99, 49, 1, 1)));
+        for bad in [
+            rect(-1, 0, 1, 1),
+            rect(0, -1, 1, 1),
+            rect(0, 0, 0, 1),
+            rect(0, 0, 1, -1),
+            rect(99, 0, 2, 1),
+            rect(0, 49, 1, 2),
+            rect(i32::MAX, 0, 1, 1),
+        ] {
+            assert!(!valid_region(100, 50, &bad));
+        }
+    }
+
+    #[test]
+    fn descriptors_reject_implicit_multiplane_and_short_rows() {
+        assert!(valid_descriptor(64, 32, 1, Modifier::Linear, 256));
+        assert!(!valid_descriptor(64, 32, 1, Modifier::Linear, 255));
+        assert!(!valid_descriptor(64, 32, 2, Modifier::Linear, 256));
+        assert!(!valid_descriptor(64, 32, 1, Modifier::Invalid, 256));
+        assert!(!valid_descriptor(0, 32, 1, Modifier::Linear, 256));
+        assert!(!valid_descriptor(64, -1, 1, Modifier::Linear, 256));
+        assert!(!valid_descriptor(i32::MAX, 32, 1, Modifier::Linear, u32::MAX));
+    }
+
+    #[test]
+    fn memory_type_intersection() {
+        assert_eq!(select_memory_type(0b1010 & 0b1100), Some(3));
+        assert_eq!(select_memory_type(1 & 2), None);
+        assert_eq!(select_memory_type(1 << 31), Some(31));
     }
 }

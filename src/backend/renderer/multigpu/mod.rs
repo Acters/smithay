@@ -79,17 +79,12 @@ use wayland_server::protocol::{wl_buffer, wl_shm, wl_surface::WlSurface};
 
 #[cfg(all(feature = "backend_gbm", feature = "backend_egl", feature = "renderer_gl"))]
 pub mod gbm;
+#[cfg(feature = "backend_vulkan")]
+mod transfer;
+#[cfg(feature = "backend_vulkan")]
 pub mod vkbridge;
-
-/// Callback invoked when a bridge copy completes.
-#[derive(Clone)]
-pub struct CompletionNotifier(pub std::sync::Arc<dyn Fn() + Send + Sync>);
-
-impl std::fmt::Debug for CompletionNotifier {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("CompletionNotifier(..)")
-    }
-}
+#[cfg(feature = "backend_vulkan")]
+use transfer::TransferState;
 
 /// Tracks available gpus from a given [`GraphicsApi`]
 #[derive(Debug)]
@@ -97,15 +92,12 @@ pub struct GpuManager<A: GraphicsApi> {
     api: A,
     devices: Vec<A::Device>,
     dmabuf_cache: HashMap<(DrmNode, DrmNode), Option<(bool, Dmabuf)>>,
-    /// Target-gpu-owned destination buffers for the vulkan bridge, keyed by
-    /// (render node, target node). Each entry is (ring of buffers, rotation
-    /// index). Buffers are allocated from the TARGET device's allocator as
-    /// LINEAR, written by the bridge's vulkan copy, and presented directly.
-    bridge_dst_rings: HashMap<(DrmNode, DrmNode), (Vec<Dmabuf>, usize)>,
-    bridge: BridgeState,
-    /// Channel notified whenever a bridge copy completes; the compositor
-    /// event loop uses it to schedule presents for completed frames.
-    completion_notifier: Option<CompletionNotifier>,
+    #[cfg(feature = "backend_vulkan")]
+    transfers: HashMap<(DrmNode, DrmNode), TransferState>,
+    #[cfg(feature = "backend_vulkan")]
+    vulkan_transfer_enabled: bool,
+    #[cfg(feature = "backend_vulkan")]
+    transfer_generation: Arc<()>,
     span: tracing::Span,
 }
 
@@ -238,28 +230,37 @@ impl<A: GraphicsApi> AsMut<A> for GpuManager<A> {
 }
 
 impl<A: GraphicsApi> GpuManager<A> {
-    /// Set the callback invoked whenever a bridge copy completes; the
-    /// compositor's event loop uses it to schedule presents for completed
-    /// frames (without it, completed copies wait for unrelated damage).
-    pub fn set_completion_notifier(&mut self, f: impl Fn() + Send + Sync + 'static) {
-        let f = std::sync::Arc::new(f);
-        self.completion_notifier = Some(CompletionNotifier(f.clone()));
-        if let BridgeState::Ready(bridge) = &mut self.bridge {
-            bridge.set_completion_notifier(f);
+    // Device re-enumeration is a generation boundary for cached transfer resources.
+    fn reset_transfer_storage(&mut self) {
+        #[cfg(feature = "backend_vulkan")]
+        {
+            self.transfers.clear();
+            self.dmabuf_cache.clear();
+            self.transfer_generation = Arc::new(());
         }
     }
 
-    /// Returns true if a completed bridge copy is newer than the last one
-    /// presented (i.e. there is a completed frame waiting to be shown on a
-    /// foreign output). Used by the completion notification to decide whether
-    /// a redraw is actually needed.
-    pub fn bridge_pending_completed(&self) -> bool {
-        match &self.bridge {
-            BridgeState::Ready(bridge) => {
-                let latest = bridge.latest_completed().map(|(seq, _, _)| seq).unwrap_or(0);
-                latest > bridge.last_presented_seq()
-            }
-            _ => false,
+    #[cfg(feature = "backend_vulkan")]
+    fn prepare_transfer_pair(&mut self, pair: (DrmNode, DrmNode), source_generation: Arc<()>) {
+        let stale = self
+            .transfers
+            .get(&pair)
+            .is_some_and(|state| !state.matches_generation(&source_generation));
+        if stale {
+            self.transfers.remove(&pair);
+            self.dmabuf_cache.remove(&pair);
+        }
+        self.transfers.entry(pair).or_default().source_generation = Some(source_generation);
+    }
+
+    /// Enable or disable optional Vulkan transfers when direct DMA-BUF sharing fails.
+    ///
+    /// Disabling also retires transfer storage; CPU copies retain their upstream behavior.
+    #[cfg(feature = "backend_vulkan")]
+    pub fn set_vulkan_transfer_enabled(&mut self, enabled: bool) {
+        if self.vulkan_transfer_enabled != enabled {
+            self.reset_transfer_storage();
+            self.vulkan_transfer_enabled = enabled;
         }
     }
 
@@ -274,9 +275,12 @@ impl<A: GraphicsApi> GpuManager<A> {
             api,
             devices,
             dmabuf_cache: HashMap::new(),
-            bridge_dst_rings: HashMap::new(),
-            bridge: BridgeState::NotTried,
-            completion_notifier: None,
+            #[cfg(feature = "backend_vulkan")]
+            transfers: HashMap::new(),
+            #[cfg(feature = "backend_vulkan")]
+            vulkan_transfer_enabled: true,
+            #[cfg(feature = "backend_vulkan")]
+            transfer_generation: Arc::new(()),
             span,
         })
     }
@@ -284,6 +288,7 @@ impl<A: GraphicsApi> GpuManager<A> {
     /// Get all devices enumerated by the API.
     pub fn devices(&mut self) -> Result<impl Iterator<Item = &A::Device>, A::Error> {
         if self.api.needs_enumeration() {
+            self.reset_transfer_storage();
             self.api.enumerate(&mut self.devices)?;
         }
         Ok(self.devices.iter())
@@ -292,6 +297,7 @@ impl<A: GraphicsApi> GpuManager<A> {
     /// Get all devices enumerated by the API.
     pub fn devices_mut(&mut self) -> Result<impl Iterator<Item = &mut A::Device>, A::Error> {
         if self.api.needs_enumeration() {
+            self.reset_transfer_storage();
             self.api.enumerate(&mut self.devices)?;
         }
         Ok(self.devices.iter_mut())
@@ -319,6 +325,7 @@ impl<A: GraphicsApi> GpuManager<A> {
     /// failure is logged, and the first error is returned.
     #[profiling::function]
     pub fn invalidate_caches(&mut self) -> Result<(), Error<A, A>> {
+        self.reset_transfer_storage();
         self.dmabuf_cache.clear();
 
         let mut result = Ok(());
@@ -339,6 +346,7 @@ impl<A: GraphicsApi> GpuManager<A> {
         device: &DrmNode,
     ) -> Result<MultiRenderer<'api, 'api, A, A>, Error<A, A>> {
         if !self.devices.iter().any(|dev| dev.node() == device) || self.api.needs_enumeration() {
+            self.reset_transfer_storage();
             self.api
                 .enumerate(&mut self.devices)
                 .map_err(Error::RenderApiError)?;
@@ -386,6 +394,7 @@ impl<A: GraphicsApi> GpuManager<A> {
             || !self.devices.iter().any(|device| device.node() == target_device)
             || self.api.needs_enumeration()
         {
+            self.reset_transfer_storage();
             self.api
                 .enumerate(&mut self.devices)
                 .map_err(Error::RenderApiError)?;
@@ -398,6 +407,8 @@ impl<A: GraphicsApi> GpuManager<A> {
             return Err(Error::NoDevice(*target_device));
         }
 
+        #[cfg(feature = "backend_vulkan")]
+        self.prepare_transfer_pair((*render_device, *target_device), self.transfer_generation.clone());
         let (mut render, others) = self
             .devices
             .iter_mut()
@@ -415,13 +426,13 @@ impl<A: GraphicsApi> GpuManager<A> {
                         .dmabuf_cache
                         .entry((*render_device, *target_device))
                         .or_default(),
+                    #[cfg(feature = "backend_vulkan")]
+                    transfer: self.vulkan_transfer_enabled.then(|| {
+                        self.transfers
+                            .entry((*render_device, *target_device))
+                            .or_default()
+                    }),
                     format: copy_format,
-                    bridge: &mut self.bridge,
-                    bridge_dsts: self
-                        .bridge_dst_rings
-                        .entry((*render_device, *target_device))
-                        .or_default(),
-                    completion_notifier: self.completion_notifier.clone().map(|n| n.0),
                 }),
                 other_renderers: others,
                 span: tracing::Span::current(),
@@ -455,8 +466,6 @@ impl<A: GraphicsApi> GpuManager<A> {
     where
         <A::Device as ApiDevice>::Renderer: Bind<Dmabuf>,
         <B::Device as ApiDevice>::Renderer: ImportDma,
-        // the vulkan bridge state is borrowed from the render gpu's manager
-        'render: 'target,
     {
         if !render_api
             .devices
@@ -464,6 +473,8 @@ impl<A: GraphicsApi> GpuManager<A> {
             .any(|device| device.node() == render_device)
             || render_api.api.needs_enumeration()
         {
+            render_api.reset_transfer_storage();
+            target_api.reset_transfer_storage();
             render_api
                 .api
                 .enumerate(&mut render_api.devices)
@@ -476,6 +487,8 @@ impl<A: GraphicsApi> GpuManager<A> {
             .any(|device| device.node() == target_device)
             || target_api.api.needs_enumeration()
         {
+            render_api.reset_transfer_storage();
+            target_api.reset_transfer_storage();
             target_api
                 .api
                 .enumerate(&mut target_api.devices)
@@ -497,6 +510,13 @@ impl<A: GraphicsApi> GpuManager<A> {
             return Err(Error::NoDevice(*target_device));
         }
 
+        // The source manager may have been re-enumerated or invalidated before
+        // this call. Validate its generation even when it currently disables Vulkan.
+        #[cfg(feature = "backend_vulkan")]
+        target_api.prepare_transfer_pair(
+            (*render_device, *target_device),
+            render_api.transfer_generation.clone(),
+        );
         let (mut render, others) = render_api
             .devices
             .iter_mut()
@@ -516,13 +536,14 @@ impl<A: GraphicsApi> GpuManager<A> {
                         .dmabuf_cache
                         .entry((*render_device, *target_device))
                         .or_default(),
+                    #[cfg(feature = "backend_vulkan")]
+                    transfer: render_api.vulkan_transfer_enabled.then(|| {
+                        target_api
+                            .transfers
+                            .entry((*render_device, *target_device))
+                            .or_default()
+                    }),
                     format: copy_format,
-                    bridge: &mut render_api.bridge,
-                    bridge_dsts: render_api
-                        .bridge_dst_rings
-                        .entry((*render_device, *target_device))
-                        .or_default(),
-                    completion_notifier: render_api.completion_notifier.clone().map(|n| n.0),
                 }),
                 other_renderers: others,
                 span: tracing::Span::current(),
@@ -1014,43 +1035,23 @@ where
     span: tracing::span::EnteredSpan,
 }
 
-/// State of the lazy vulkan bridge initialization.
-///
-/// Initialization happens on a background thread: on some driver stacks
-/// `vkCreateInstance` can block indefinitely inside the ICD (observed with
-/// proprietary NVIDIA inside a compositor process holding DRM master), and
-/// this must never block the compositor's main loop.
-
-#[derive(Debug)]
-enum BridgeState {
-    NotTried,
-    Initializing(std::sync::mpsc::Receiver<Result<vkbridge::VkBridge, vkbridge::VkBridgeError>>),
-    Ready(vkbridge::VkBridge),
-    Failed,
-}
-
 struct TargetData<'target, T: GraphicsApi> {
     device: &'target mut T::Device,
     cached_buffer: &'target mut Option<(bool, Dmabuf)>,
+    #[cfg(feature = "backend_vulkan")]
+    transfer: Option<&'target mut TransferState>,
     format: Fourcc,
-    bridge: &'target mut BridgeState,
-    bridge_dsts: &'target mut (Vec<Dmabuf>, usize),
-    completion_notifier: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
-
-// (TargetData holds the raw callback Arc)' 
 
 struct TargetFrameData<'target, 'frame, 'buffer, T: GraphicsApi> {
     device: &'frame mut &'target mut T::Device,
     framebuffer: &'frame mut <<T::Device as ApiDevice>::Renderer as RendererSuper>::Framebuffer<'buffer>,
     texture: Option<<<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>,
+    #[cfg(feature = "backend_vulkan")]
+    transfer: Option<&'frame mut TransferState>,
+    #[cfg(feature = "backend_vulkan")]
+    source: Dmabuf,
     format: Fourcc,
-    /// The staging buffer the frame is being rendered into on the render gpu
-    /// (only needed by the vulkan bridge path).
-    dmabuf: Option<Dmabuf>,
-    /// The target-gpu-owned destination buffer for this frame's bridge copy.
-    bridge_dst: Option<Dmabuf>,
-    bridge: Option<&'frame mut vkbridge::VkBridge>,
 }
 
 impl<'frame, 'buffer, R: GraphicsApi + 'frame, T: GraphicsApi> fmt::Debug
@@ -1316,14 +1317,39 @@ where
     where
         'buffer: 'frame,
     {
+        #[cfg(feature = "backend_vulkan")]
+        let mut transfer = None;
+        #[cfg(feature = "backend_vulkan")]
+        let mut source = None;
         let target_state = if let Some(target) = self.target.as_mut() {
             let buffer_size = size.to_logical(1).to_buffer(1, Transform::Normal);
+            #[cfg(feature = "backend_vulkan")]
+            let mut transfer_modifiers = None;
+            #[cfg(feature = "backend_vulkan")]
+            if target.cached_buffer.as_ref().is_some_and(|(direct, _)| !direct) {
+                if let Some(state) = target.transfer.as_deref_mut() {
+                    if state.device_lost {
+                        return Err(Error::DeviceMissing);
+                    }
+                    transfer_modifiers =
+                        state.source_modifiers(*self.render.node(), target.format, buffer_size);
+                    if state.device_lost {
+                        return Err(Error::DeviceMissing);
+                    }
+                }
+                if let (Some(modifiers), Some((_, dmabuf))) = (&transfer_modifiers, &target.cached_buffer) {
+                    if !modifiers.contains(&dmabuf.format().modifier) {
+                        // The async device initialization may have finished since the
+                        // CPU staging allocation. Negotiate a GLES/Vulkan-compatible
+                        // modifier rather than importing a guessed native layout.
+                        *target.cached_buffer = None;
+                    }
+                }
+            }
 
             if let Some((_, dmabuf)) = &target.cached_buffer {
                 if dmabuf.size() != buffer_size || BufferTrait::format(dmabuf).code != target.format {
                     *target.cached_buffer = None;
-                    // dst buffers are stale too (wrong size/format)
-                    target.bridge_dsts.0.clear();
                 }
             };
 
@@ -1339,13 +1365,45 @@ where
                             *target.device.node(),
                             err
                         );
-                        info!("Falling back to cpu-copy.");
+                        info!("Using staging transfer (Vulkan when supported, otherwise CPU).");
                         let modifiers = Bind::<Dmabuf>::supported_formats(self.render.renderer())
                             .unwrap_or_default()
                             .into_iter()
                             .filter(|format| format.code == target.format)
                             .map(|f| f.modifier)
                             .collect::<Vec<_>>();
+                        #[cfg(feature = "backend_vulkan")]
+                        let modifiers = {
+                            if transfer_modifiers.is_none() {
+                                if let Some(state) = target.transfer.as_deref_mut() {
+                                    transfer_modifiers = state.source_modifiers(
+                                        *self.render.node(),
+                                        target.format,
+                                        buffer_size,
+                                    );
+                                    if state.device_lost {
+                                        return Err(Error::DeviceMissing);
+                                    }
+                                }
+                            }
+                            if let Some(transfer_modifiers) = &transfer_modifiers {
+                                let intersection = modifiers
+                                    .iter()
+                                    .copied()
+                                    .filter(|m| transfer_modifiers.contains(m))
+                                    .collect::<Vec<_>>();
+                                if intersection.is_empty() {
+                                    if let Some(state) = target.transfer.as_deref_mut() {
+                                        state.disable();
+                                    }
+                                    modifiers
+                                } else {
+                                    intersection
+                                }
+                            } else {
+                                modifiers
+                            }
+                        };
                         let mut dmabuf = self
                             .render
                             .allocator()
@@ -1356,6 +1414,18 @@ where
                                 &modifiers,
                             )
                             .map_err(Error::AllocatorError)?;
+                        #[cfg(feature = "backend_vulkan")]
+                        if transfer_modifiers
+                            .as_ref()
+                            .is_some_and(|m| !m.contains(&dmabuf.format().modifier))
+                        {
+                            warn!(
+                                "allocator did not honor the negotiated Vulkan source modifier; using CPU copy"
+                            );
+                            if let Some(state) = target.transfer.as_deref_mut() {
+                                state.disable();
+                            }
+                        }
 
                         {
                             // make sure we mark this as a framebuffer on render first (some GL drivers don't like us to do this later).
@@ -1371,17 +1441,6 @@ where
                             // drop everything
                         }
 
-                        if matches!(*target.bridge, BridgeState::NotTried) {
-                            // the preinit instance is consumed inside VkBridge::new
-                            let node = *self.render.node();
-                            let (tx, rx) = std::sync::mpsc::channel();
-                            info!("vkbridge: spawning init thread");
-                            std::thread::spawn(move || {
-                                let _ = tx.send(vkbridge::VkBridge::new(node));
-                            });
-                            *target.bridge = BridgeState::Initializing(rx);
-                        }
-
                         *target.cached_buffer = Some((false, dmabuf));
                     }
                 }
@@ -1389,6 +1448,28 @@ where
 
             // try to import on target node
             let (direct, dmabuf) = target.cached_buffer.as_mut().unwrap();
+            #[cfg(feature = "backend_vulkan")]
+            {
+                source = Some(dmabuf.clone());
+                if let Some(state) = target.transfer.as_deref_mut() {
+                    // External memory contents become undefined after device loss.
+                    // Require explicit invalidation/recreation, not partial CPU reuse.
+                    if state.device_lost {
+                        return Err(Error::DeviceMissing);
+                    }
+                    state.set_source(dmabuf);
+                    // A previous copy may still be reading this allocation. Queue a
+                    // GPU wait before any further GLES writes, including partial frames.
+                    self.render
+                        .renderer_mut()
+                        .wait(&state.source_release)
+                        .map_err(Error::Render)?;
+                    if !*direct {
+                        let _ = state.engine(*self.render.node());
+                    }
+                    transfer = Some(state);
+                }
+            }
             // TODO: We could cache that texture all the way back to the GpuManager in a HashMap<WeakDmabuf, Texture>.
             let texture = (*direct)
                 .then(|| {
@@ -1399,68 +1480,9 @@ where
                         .map_err(Error::Target)
                 })
                 .transpose()?;
-            // advance the (background) bridge init, if one is in flight
-            let init_result = match &mut *target.bridge {
-                BridgeState::Initializing(rx) => match rx.try_recv() {
-                    Ok(Ok(bridge)) => {
-                        info!("vkbridge: init completed");
-                        if let Some(tx) = &target.completion_notifier {
-                            debug!("vkbridge: completion notifier set on bridge");
-                            bridge.set_completion_notifier(tx.clone());
-                        } else {
-                            warn!("vkbridge: NO completion notifier available at Ready transition");
-                        }
-                        Some(BridgeState::Ready(bridge))
-                    }
-                    Ok(Err(err)) => {
-                        warn!("vkbridge: init failed: {err}");
-                        Some(BridgeState::Failed)
-                    }
-                    Err(_) => None,
-                },
-                _ => None,
-            };
-            if let Some(state) = init_result {
-                *target.bridge = state;
-            }
-
-            let staging_dmabuf = dmabuf.clone();
-            // before re-rendering into the (persistent) staging buffer, wait
-            // for the copy worker to finish consuming it (bounded: the worker
-            // usually finished long ago; never a full pipeline stall)
-            if let BridgeState::Ready(bridge) = &mut *target.bridge {
-                if !*direct {
-                    bridge.wait_for_pending_copies();
-                }
-            }
             let framebuffer = self.render.renderer_mut().bind(dmabuf).map_err(Error::Render)?;
-            let (bridge, bridge_dst) = match &mut *target.bridge {
-                BridgeState::Ready(bridge) => {
-                    // pick the next destination buffer from the ring,
-                    // allocating from the TARGET device's allocator as LINEAR
-                    const DST_RING_SIZE: usize = 3;
-                    let (ring, idx) = &mut *target.bridge_dsts;
-                    let dst_idx = *idx % DST_RING_SIZE;
-                    *idx = idx.wrapping_add(1);
-                    if ring.len() <= dst_idx {
-                        match target.device.allocator().create_buffer(
-                            buffer_size.w as u32,
-                            buffer_size.h as u32,
-                            target.format,
-                            &[Modifier::Linear],
-                        ) {
-                            Ok(bo) => ring.push(bo),
-                            Err(err) => {
-                                warn!("vulkan bridge: failed to allocate dst buffer: {err}");
-                            }
-                        }
-                    }
-                    (Some(bridge), ring.get(dst_idx).cloned())
-                }
-                _ => (None, None),
-            };
 
-            Some((&mut target.device, framebuffer, texture, target.format, staging_dmabuf, bridge, bridge_dst))
+            Some((&mut target.device, framebuffer, texture, target.format))
         } else {
             None
         };
@@ -1485,16 +1507,16 @@ where
                     .map_err(Error::Render)?
             }
             MultiFramebufferInternal::Target(target_framebuffer) => {
-                let (target_device, render_framebuffer, texture, format, staging_dmabuf, bridge, bridge_dst) =
-                    target_state.unwrap();
+                let (target_device, render_framebuffer, texture, format) = target_state.unwrap();
                 target = Some(TargetFrameData {
                     device: target_device,
                     framebuffer: target_framebuffer,
                     texture,
+                    #[cfg(feature = "backend_vulkan")]
+                    transfer,
+                    #[cfg(feature = "backend_vulkan")]
+                    source: source.unwrap(),
                     format,
-                    dmabuf: Some(staging_dmabuf),
-                    bridge_dst,
-                    bridge,
                 });
                 let mut render_framebuffer = AliasableBox::from_unique(Box::new(render_framebuffer));
 
@@ -1565,6 +1587,10 @@ where
             result = result.and(invalidate_device_caches(device).map_err(Error::Render));
         }
         if let Some(target) = self.target.as_mut() {
+            #[cfg(feature = "backend_vulkan")]
+            if let Some(state) = target.transfer.as_deref_mut() {
+                *state = TransferState::default();
+            }
             *target.cached_buffer = None;
             result = result.and(invalidate_device_caches(&mut *target.device).map_err(Error::Target));
         }
@@ -1684,6 +1710,13 @@ where
             //   - The mutable reference is used in a function which mutably borrows the frame, that either being `.finish()`
             //      (which takes ownership of the frame) or dropping the frame.
             let render = unsafe { &mut *self.render };
+            #[cfg(feature = "backend_vulkan")]
+            if let Some(state) = self.target.as_ref().and_then(|target| target.transfer.as_deref()) {
+                render
+                    .renderer_mut()
+                    .wait(&state.source_release)
+                    .map_err(Error::Render)?;
+            }
 
             // We extend the lifetime to 'frame, because this is self-referential.
             // SAFETY:
@@ -1799,125 +1832,176 @@ where
                     copy_rects = Vec::from([Rectangle::from_size(buffer_size)]);
                 }
 
-                // no damage at all: upstream skips the copy entirely here, and
-                // so must the bridge — otherwise we burn a full-frame vulkan
-                // copy for every empty-damage present (observed: the internal
-                // panel presents empty frames at ~30fps while another output
-                // animates, costing a whole copy worker core for nothing)
-                // NOTE: only the copy *submission* is skipped on empty damage;
-                // previously completed copies may still need presenting
-                // (e.g. after content disappeared), so presentation continues.
-
-                // v3 pipeline: submit this frame's staging buffer to the copy
-                // worker (never blocks the compositor) and consume the latest
-                // completed copy (typically the previous frame). The render
-                // sync point is awaited on the worker thread; no cross-driver
-                // fences are used. The target output lags one frame behind.
-                // NOTE: full-frame copies for now. Damage-region copies must
-                // not be paired with this frame's damage list: the completed
-                // buffer we composite here is one frame old, so its valid
-                // regions would not cover this frame's damage, sampling
-                // uninitialized garbage (the "cycling glitched frame" bug).
+                #[cfg(feature = "backend_vulkan")]
                 if !copy_rects.is_empty() {
-                    if let Some(bridge) = target.bridge.as_mut() {
-                        if let (Some(staging), Some(dst)) = (target.dmabuf.clone(), target.bridge_dst.clone()) {
-                            bridge.submit_copy(staging, dst, sync.clone(), Vec::new());
+                    if let Some(state) = target.transfer.as_deref_mut() {
+                        'transfer: {
+                            let modifiers = state.source_modifiers(self.node, target.format, buffer_size);
+                            if state.device_lost {
+                                return Err(Error::DeviceMissing);
+                            }
+                            let Some(modifiers) = modifiers else {
+                                break 'transfer;
+                            };
+                            if !modifiers.contains(&target.source.format().modifier) {
+                                // Initialization finished after rendering began. Keep this
+                                // frame on the CPU path; the next render negotiates storage.
+                                break 'transfer;
+                            }
+                            let destination = if let Some(destination) = &state.destination {
+                                destination.clone()
+                            } else {
+                                match target.device.allocator().create_buffer(
+                                    buffer_size.w as u32,
+                                    buffer_size.h as u32,
+                                    target.format,
+                                    &[Modifier::Linear],
+                                ) {
+                                    Ok(destination) => {
+                                        state.destination = Some(destination.clone());
+                                        destination
+                                    }
+                                    Err(err) => {
+                                        warn!(
+                                            "Vulkan transfer destination allocation failed, using CPU copy: {err}"
+                                        );
+                                        state.disable();
+                                        break 'transfer;
+                                    }
+                                }
+                            };
+                            // Probe target import before submitting any writes. This is an
+                            // intermediate texture, not a scanout buffer or a previous frame.
+                            let texture = match target
+                                .device
+                                .renderer_mut()
+                                .import_dmabuf(&destination, Some(&copy_rects))
+                            {
+                                Ok(texture) => texture,
+                                Err(err) => {
+                                    warn!("Vulkan transfer target import failed, using CPU copy: {err}");
+                                    state.disable();
+                                    break 'transfer;
+                                }
+                            };
+                            let destination_release = state.destination_release.clone();
+                            let copy_sync = match state.engine(self.node).unwrap().copy(
+                                &target.source,
+                                &destination,
+                                &sync,
+                                Some(&destination_release),
+                                &copy_rects,
+                            ) {
+                                Ok(copy_sync) => copy_sync,
+                                Err(err) => {
+                                    if err.is_device_lost() {
+                                        warn!("Vulkan transfer device lost; invalidation is required: {err}");
+                                        state.device_lost = true;
+                                        state.disable();
+                                        return Err(Error::DeviceMissing);
+                                    }
+                                    warn!("Vulkan transfer failed, using CPU copy: {err}");
+                                    state.disable();
+                                    break 'transfer;
+                                }
+                            };
+                            debug!(source = ?self.node, target = ?target.device.node(), native_fence = copy_sync.is_exportable(), "submitted same-frame Vulkan transfer");
+                            state.source_release = copy_sync.clone();
+                            let result = (|| {
+                                let mut frame = target
+                                    .device
+                                    .renderer_mut()
+                                    .render(target.framebuffer, self.size, Transform::Normal)
+                                    .map_err(Error::Target)?;
+                                // Queue a dependency, not a CPU completion wait, where the
+                                // target supports importing the native copy fence.
+                                let draw_result = (|| {
+                                    frame.wait(&copy_sync).map_err(Error::Target)?;
+                                    let physical_damage = damage
+                                        .iter()
+                                        .map(|rect| {
+                                            rect.to_logical(1, Transform::Normal, &buffer_size).to_physical(1)
+                                        })
+                                        .collect::<Vec<_>>();
+                                    frame
+                                        .clear(Color32F::TRANSPARENT, &physical_damage)
+                                        .map_err(Error::Target)?;
+                                    frame
+                                        .render_texture_from_to(
+                                            &texture,
+                                            Rectangle::from_size(buffer_size).to_f64(),
+                                            Rectangle::from_size(self.size),
+                                            &physical_damage,
+                                            &[Rectangle::from_size(self.size)],
+                                            Transform::Normal,
+                                            1.0,
+                                        )
+                                        .map_err(Error::Target)
+                                })();
+                                // Even if drawing failed, finish explicitly so any queued
+                                // reader has a retirement fence before this buffer is reused.
+                                let target_sync = frame.finish().map_err(Error::Target)?;
+                                state.destination_release = target_sync.clone();
+                                draw_result?;
+                                Ok(target_sync)
+                            })();
+                            if result.is_err() {
+                                // A failed finish may not provide a reader fence. Never
+                                // recycle that allocation for subsequent Vulkan writes.
+                                state.destination = None;
+                            }
+                            let target_sync = result?;
+                            render
+                                .renderer_mut()
+                                .cleanup_texture_cache()
+                                .map_err(Error::Render)?;
+                            return Ok(target_sync);
                         }
                     }
                 }
-                // only present each completed copy once; re-presenting a stale
-                // copy kept a ghost frame alive when content disappeared
-                let bridged = target
-                    .bridge
-                    .as_mut()
-                    .and_then(|bridge| {
-                        bridge.completed_newer_than(bridge.last_presented_seq()).and_then(
-                            |(seq, linear, completion_fd)| {
-                                target
-                                    .device
-                                    .renderer_mut()
-                                    .import_dmabuf(&linear, Some(&[Rectangle::from_size(buffer_size)]))
-                                    .map_err(|err| {
-                                        warn!("vulkan bridge: failed to import dst on target: {err}");
-                                        err
-                                    })
-                                    .ok()
-                                    .map(|texture| {
-                                        bridge.mark_presented(seq);
-                                        (texture, completion_fd)
-                                    })
-                            },
-                        )
-                    });
-                let (bridged_texture, copy_sync) = match bridged {
-                    Some((texture, fd)) => (
-                        Some(texture),
-                        Some(sync::SyncPoint::from(vkbridge::NativeFdFence::new(fd))),
-                    ),
-                    None => (None, None),
-                };
 
-                let textures = if let Some(texture) = bridged_texture {
-                    // The bridge copy lags one frame behind, so damage-limited
-                    // blits make the target swapchain buffers diverge (every
-                    // other buffer showing a one-frame-older base image: the
-                    // "rhythmic old frame" flicker). Always repaint the full
-                    // target from the completed copy.
-                    damage = vec![Rectangle::from_size(buffer_size)];
-                    vec![(texture, Rectangle::from_size(buffer_size))]
-                } else if target.bridge.is_some() {
-                    // bridge is ready but hasn't completed its first copy yet;
-                    // skip this frame instead of hitting the (broken on this
-                    // stack) cpu readback path
-                    return Ok(sync::SyncPoint::signaled());
-                } else {
-                    let mut mappings = Vec::new();
-                    for rect in copy_rects {
-                        let mapping = (
-                            ExportMem::copy_framebuffer(
-                                render.renderer_mut(),
-                                self.framebuffer.as_ref().unwrap(),
-                                rect,
-                                format,
-                            )
-                            .map_err(Error::Render)?,
+                let mut mappings = Vec::new();
+                for rect in copy_rects {
+                    let mapping = (
+                        ExportMem::copy_framebuffer(
+                            render.renderer_mut(),
+                            self.framebuffer.as_ref().unwrap(),
                             rect,
-                        );
-                        mappings.push(mapping);
-                    }
+                            format,
+                        )
+                        .map_err(Error::Render)?,
+                        rect,
+                    );
+                    mappings.push(mapping);
+                }
 
-                    if mappings.is_empty() {
-                        render
+                if mappings.is_empty() {
+                    render
+                        .renderer_mut()
+                        .cleanup_texture_cache()
+                        .map_err(Error::Render)?;
+                    return Ok(sync::SyncPoint::signaled());
+                }
+
+                let textures = mappings
+                    .into_iter()
+                    .map(|(mapping, rect)| {
+                        let slice = ExportMem::map_texture(render.renderer_mut(), &mapping)
+                            .map_err(Error::Render::<R, T>)?;
+                        let texture = target
+                            .device
                             .renderer_mut()
-                            .cleanup_texture_cache()
-                            .map_err(Error::Render)?;
-                        return Ok(sync::SyncPoint::signaled());
-                    }
-
-                    mappings
-                        .into_iter()
-                        .map(|(mapping, rect)| {
-                            let slice = ExportMem::map_texture(render.renderer_mut(), &mapping)
-                                .map_err(Error::Render::<R, T>)?;
-                            let texture = target
-                                .device
-                                .renderer_mut()
-                                .import_memory(slice, TextureMapping::format(&mapping), rect.size, false)
-                                .map_err(Error::Target)?;
-                            Ok((texture, rect))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?
-                };
+                            .import_memory(slice, TextureMapping::format(&mapping), rect.size, false)
+                            .map_err(Error::Target)?;
+                        Ok((texture, rect))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
 
                 let mut frame = target
                     .device
                     .renderer_mut()
                     .render(target.framebuffer, self.size, Transform::Normal)
                     .map_err(Error::Target)?;
-                if let Some(sp) = &copy_sync {
-                    // gpu-side wait for the bridge copy to finish before sampling
-                    frame.wait(sp).map_err(Error::Target)?;
-                }
                 for (texture, rect) in textures {
                     for damage_rect in damage.iter().filter_map(|dmg_rect| dmg_rect.intersection(rect)) {
                         let dst = damage_rect
