@@ -97,6 +97,8 @@ pub struct GpuManager<A: GraphicsApi> {
     #[cfg(feature = "backend_vulkan")]
     vulkan_transfer_enabled: bool,
     #[cfg(feature = "backend_vulkan")]
+    vulkan_direct_target_enabled: bool,
+    #[cfg(feature = "backend_vulkan")]
     transfer_generation: Arc<()>,
     span: tracing::Span,
 }
@@ -241,7 +243,12 @@ impl<A: GraphicsApi> GpuManager<A> {
     }
 
     #[cfg(feature = "backend_vulkan")]
-    fn prepare_transfer_pair(&mut self, pair: (DrmNode, DrmNode), source_generation: Arc<()>) {
+    fn prepare_transfer_pair(
+        &mut self,
+        pair: (DrmNode, DrmNode),
+        source_generation: Arc<()>,
+        direct_target_enabled: bool,
+    ) {
         let stale = self
             .transfers
             .get(&pair)
@@ -250,7 +257,9 @@ impl<A: GraphicsApi> GpuManager<A> {
             self.transfers.remove(&pair);
             self.dmabuf_cache.remove(&pair);
         }
-        self.transfers.entry(pair).or_default().source_generation = Some(source_generation);
+        let state = self.transfers.entry(pair).or_default();
+        state.source_generation = Some(source_generation);
+        state.direct_target_enabled = direct_target_enabled;
     }
 
     /// Enable or disable optional Vulkan transfers when direct DMA-BUF sharing fails.
@@ -261,6 +270,21 @@ impl<A: GraphicsApi> GpuManager<A> {
         if self.vulkan_transfer_enabled != enabled {
             self.reset_transfer_storage();
             self.vulkan_transfer_enabled = enabled;
+        }
+    }
+
+    /// Opt in to Vulkan writes directly into compatible bound target framebuffers.
+    ///
+    /// Disabled by default. Only effective while transfers remain enabled through
+    /// [`Self::set_vulkan_transfer_enabled`].
+    /// Unsupported targets retain the intermediate transfer/CPU fallback paths. The caller
+    /// still owns target reuse and, for scanout, the DRM swapchain's presentation lifetime.
+    /// Changing this policy retires storage and invalidates cross-manager source generations.
+    #[cfg(feature = "backend_vulkan")]
+    pub fn set_vulkan_direct_target_enabled(&mut self, enabled: bool) {
+        if self.vulkan_direct_target_enabled != enabled {
+            self.reset_transfer_storage();
+            self.vulkan_direct_target_enabled = enabled;
         }
     }
 
@@ -279,6 +303,8 @@ impl<A: GraphicsApi> GpuManager<A> {
             transfers: HashMap::new(),
             #[cfg(feature = "backend_vulkan")]
             vulkan_transfer_enabled: true,
+            #[cfg(feature = "backend_vulkan")]
+            vulkan_direct_target_enabled: false,
             #[cfg(feature = "backend_vulkan")]
             transfer_generation: Arc::new(()),
             span,
@@ -408,7 +434,11 @@ impl<A: GraphicsApi> GpuManager<A> {
         }
 
         #[cfg(feature = "backend_vulkan")]
-        self.prepare_transfer_pair((*render_device, *target_device), self.transfer_generation.clone());
+        self.prepare_transfer_pair(
+            (*render_device, *target_device),
+            self.transfer_generation.clone(),
+            self.vulkan_direct_target_enabled,
+        );
         let (mut render, others) = self
             .devices
             .iter_mut()
@@ -516,6 +546,7 @@ impl<A: GraphicsApi> GpuManager<A> {
         target_api.prepare_transfer_pair(
             (*render_device, *target_device),
             render_api.transfer_generation.clone(),
+            render_api.vulkan_direct_target_enabled,
         );
         let (mut render, others) = render_api
             .devices
@@ -1043,10 +1074,27 @@ struct TargetData<'target, T: GraphicsApi> {
     format: Fourcc,
 }
 
+/// Completion of the latest ordered target work within one MultiFrame. Empty source
+/// frames must preserve this fence after a flush or target-side blit. A later write may
+/// replace it only because the target queue/external-write acquire chains earlier work.
+#[derive(Debug, Default)]
+struct TargetFrameCompletion(SyncPoint);
+
+impl TargetFrameCompletion {
+    fn record(&mut self, sync: SyncPoint) {
+        self.0 = sync;
+    }
+
+    fn current(&self) -> SyncPoint {
+        self.0.clone()
+    }
+}
+
 struct TargetFrameData<'target, 'frame, 'buffer, T: GraphicsApi> {
     device: &'frame mut &'target mut T::Device,
     framebuffer: &'frame mut <<T::Device as ApiDevice>::Renderer as RendererSuper>::Framebuffer<'buffer>,
     texture: Option<<<T::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>,
+    completion: TargetFrameCompletion,
     #[cfg(feature = "backend_vulkan")]
     transfer: Option<&'frame mut TransferState>,
     #[cfg(feature = "backend_vulkan")]
@@ -1512,6 +1560,7 @@ where
                     device: target_device,
                     framebuffer: target_framebuffer,
                     texture,
+                    completion: TargetFrameCompletion::default(),
                     #[cfg(feature = "backend_vulkan")]
                     transfer,
                     #[cfg(feature = "backend_vulkan")]
@@ -1589,7 +1638,7 @@ where
         if let Some(target) = self.target.as_mut() {
             #[cfg(feature = "backend_vulkan")]
             if let Some(state) = target.transfer.as_deref_mut() {
-                *state = TransferState::default();
+                state.invalidate();
             }
             *target.cached_buffer = None;
             result = result.and(invalidate_device_caches(&mut *target.device).map_err(Error::Target));
@@ -1699,9 +1748,20 @@ where
     <<R::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
     <<T::Device as ApiDevice>::Renderer as RendererSuper>::Error: 'static,
 {
+    /// Finish source/transfer work before switching to the target renderer for a blit.
+    /// Do not recreate the source frame until the target operation has finished: it may
+    /// change the current graphics context and framebuffer binding.
     fn flush_frame(&mut self) -> Result<(), Error<R, T>> {
         if self.target.is_some() {
-            let _ = self.finish_internal()?;
+            let sync = self.finish_internal()?;
+            self.target.as_mut().unwrap().completion.record(sync);
+        }
+        Ok(())
+    }
+
+    fn resume_source_frame(&mut self) -> Result<(), Error<R, T>> {
+        if self.target.is_some() {
+            debug_assert!(self.frame.is_none());
             // now the frame is gone, lets use our unholy ptr till the end of this call:
             // SAFETY:
             // - The renderer will never be invalid because the lifetime of the frame must be shorter than the renderer.
@@ -1738,6 +1798,34 @@ where
             self.frame = Some(frame);
         }
         Ok(())
+    }
+
+    /// Restore the source renderer even after a failed target blit, when possible.
+    /// Preserve a successful target completion before resuming so a resume error cannot
+    /// discard the fence for work which was already submitted to the target.
+    fn resume_after_target_blit(
+        &mut self,
+        result: Result<SyncPoint, Error<R, T>>,
+    ) -> Result<SyncPoint, Error<R, T>> {
+        if let Ok(sync) = &result {
+            self.target.as_mut().unwrap().completion.record(sync.clone());
+        }
+        let resumed = self.resume_source_frame();
+        match result {
+            Ok(sync) => {
+                resumed?;
+                Ok(sync)
+            }
+            Err(err) => {
+                if let Err(resume_err) = resumed {
+                    warn!(
+                        ?resume_err,
+                        "failed to restore source frame after target blit error"
+                    );
+                }
+                Err(err)
+            }
+        }
     }
 
     #[instrument(level = "trace", parent = &self.span, skip(self))]
@@ -1847,6 +1935,118 @@ where
                                 // Initialization finished after rendering began. Keep this
                                 // frame on the CPU path; the next render negotiates storage.
                                 break 'transfer;
+                            }
+                            // This opt-in path writes the bound framebuffer itself, not an
+                            // intermediate texture. In particular, the CPU copy rectangles
+                            // below may cover UNRENDERED staging pixels and must not be used.
+                            if state.direct_target_enabled && self.dst_transform == Transform::Normal {
+                                let direct_damage = transfer::direct_damage(&damage, buffer_size);
+                                if !direct_damage.is_empty() {
+                                    if let Some(external) = target
+                                        .device
+                                        .renderer_mut()
+                                        .prepare_external_framebuffer_write(target.framebuffer)
+                                        .map_err(Error::Target)?
+                                    {
+                                        let destination = &external.dmabuf;
+                                        let eligible = destination.format().modifier == Modifier::Linear
+                                            && destination.num_planes() == 1
+                                            && destination.size() == buffer_size
+                                            && destination.format().code == target.source.format().code
+                                            && destination.y_inverted() == target.source.y_inverted()
+                                            && !state.direct_target_rejected(destination);
+                                        if eligible {
+                                            match state.engine(self.node).unwrap().copy(
+                                                &target.source,
+                                                destination,
+                                                &sync,
+                                                Some(&external.acquire),
+                                                &direct_damage,
+                                            ) {
+                                                Ok(copy_sync) => {
+                                                    // Store ownership immediately: even a subsequent
+                                                    // target wait/cleanup failure must retire this copy.
+                                                    state.source_release = copy_sync.clone();
+                                                    debug!(
+                                                        source = ?self.node,
+                                                        target = ?target.device.node(),
+                                                        format = ?destination.format().code,
+                                                        modifier = ?destination.format().modifier,
+                                                        native_fence = copy_sync.is_exportable(),
+                                                        "submitted direct Vulkan framebuffer transfer"
+                                                    );
+                                                    // Preserve target-context ordering and refresh shared
+                                                    // texture synchronization for capture/blit/fallback.
+                                                    let result = target
+                                                        .device
+                                                        .renderer_mut()
+                                                        .finish_external_framebuffer_write(
+                                                            target.framebuffer,
+                                                            &copy_sync,
+                                                        )
+                                                        .map_err(Error::Target)
+                                                        .and_then(|()| {
+                                                            render
+                                                                .renderer_mut()
+                                                                .cleanup_texture_cache()
+                                                                .map_err(Error::Render)
+                                                        });
+                                                    if let Err(err) = result {
+                                                        // The caller may return its DRM slot on Err.
+                                                        // Never leave an external writer on that slot.
+                                                        transfer::wait(&copy_sync);
+                                                        return Err(err);
+                                                    }
+                                                    return Ok(copy_sync);
+                                                }
+                                                Err(err) => {
+                                                    if err.is_device_lost() {
+                                                        // Preparation must be paired even though no
+                                                        // external write was submitted. Preserve device
+                                                        // loss as the primary error if abort also fails.
+                                                        if let Err(finish_err) = target
+                                                            .device
+                                                            .renderer_mut()
+                                                            .finish_external_framebuffer_write(
+                                                                target.framebuffer,
+                                                                &external.acquire,
+                                                            )
+                                                        {
+                                                            warn!(
+                                                                ?finish_err,
+                                                                "failed to finish external framebuffer access after Vulkan device loss"
+                                                            );
+                                                        }
+                                                        state.device_lost = true;
+                                                        state.disable();
+                                                        return Err(Error::DeviceMissing);
+                                                    }
+                                                    // A rejected direct destination must not disable
+                                                    // the working intermediate transport. Raw Vulkan
+                                                    // errors may describe transient/source-side failures.
+                                                    if transfer::cache_direct_rejection(&err) {
+                                                        state.reject_direct_target(destination);
+                                                    }
+                                                    debug!(
+                                                        ?err,
+                                                        "direct Vulkan framebuffer transfer unavailable; using intermediate path"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        // Ineligible descriptors, cached rejection and failed
+                                        // pre-submit copies all abandon a successful preparation.
+                                        // Pair it with its acquire fence before any fallback use.
+                                        target
+                                            .device
+                                            .renderer_mut()
+                                            .finish_external_framebuffer_write(
+                                                target.framebuffer,
+                                                &external.acquire,
+                                            )
+                                            .map_err(Error::Target)?;
+                                    }
+                                }
                             }
                             let destination = if let Some(destination) = &state.destination {
                                 destination.clone()
@@ -1980,7 +2180,9 @@ where
                         .renderer_mut()
                         .cleanup_texture_cache()
                         .map_err(Error::Render)?;
-                    return Ok(sync::SyncPoint::signaled());
+                    // A preceding flush/blit may still be writing the target even
+                    // though this new source frame had nothing to transfer.
+                    return Ok(target.completion.current());
                 }
 
                 let textures = mappings
@@ -2040,7 +2242,11 @@ where
             return Ok(sync);
         }
 
-        Ok(sync::SyncPoint::signaled())
+        Ok(self
+            .target
+            .as_ref()
+            .map(|target| target.completion.current())
+            .unwrap_or_default())
     }
 }
 
@@ -3511,12 +3717,12 @@ where
             let MultiFramebufferInternal::Target(to_fb) = &mut to.0 else {
                 unreachable!()
             };
-            let sync = target
+            let result = target
                 .device
                 .renderer_mut()
                 .blit(target.framebuffer, to_fb, src, dst, filter)
-                .map_err(Error::Target)?;
-            Ok(sync)
+                .map_err(Error::Target);
+            self.resume_after_target_blit(result)
         } else {
             let MultiFramebufferInternal::Render(to_fb) = &mut to.0 else {
                 unreachable!()
@@ -3550,12 +3756,12 @@ where
             let MultiFramebufferInternal::Target(from_fb) = &from.0 else {
                 unreachable!()
             };
-            let sync = target
+            let result = target
                 .device
                 .renderer_mut()
                 .blit(from_fb, target.framebuffer, src, dst, filter)
-                .map_err(Error::Target)?;
-            Ok(sync)
+                .map_err(Error::Target);
+            self.resume_after_target_blit(result)
         } else {
             let MultiFramebufferInternal::Render(from_fb) = &from.0 else {
                 unreachable!()

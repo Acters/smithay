@@ -178,3 +178,70 @@ buffer; target GLES only sampled it for verification. No KMS framebuffer, atomic
 TEST_ONLY request, native KMS fence import, modeset or actual display was attempted
 by these render-node-only tests. Successful allocation/readback does not establish
 that a particular KMS plane/mode accepts the candidate.
+
+## Atomic acceptance and direct-target prototype
+
+A separately approved niri diagnostic ran with its existing atomic DRM ownership
+on eDP-1, 1920x1080. Both ABGR8888/XBGR8888 and ABGR2101010/XBGR2101010 explicit
+LINEAR candidates passed TEST_ONLY: first after copy completion without a fence,
+then with an exported native copy fence while `complete_at_test=false`. The helper
+never committed or displayed these buffers. Its implementation is retained on
+`nvidia-intel-bridge-scanout-probe`, not in the direct-target compositor branch.
+
+`nvidia-intel-bridge-direct-target` adds a default-off direct-write policy:
+`GpuManager::set_vulkan_direct_target_enabled(true)`. Niri maps
+`NIRI_VK_DIRECT_TARGET=1` to it and requests tested explicit-LINEAR formats only
+for foreign atomic output swapchains. Normal/native negotiation is retained, and
+failed LINEAR negotiation retries normal formats. Actual framebuffer descriptors
+are still checked by the transfer path; requested modifiers are not proof of use.
+
+The renderer's paired `prepare_external_framebuffer_write` /
+`finish_external_framebuffer_write` hooks expose the ORIGINAL bound allocation
+and its acquire fence, then publish the external completion into renderer-specific
+synchronization. GLES supports its Image fallback and the usual Texture binding
+only when that texture target came from the original DMA-BUF. Ordinary textures,
+renderbuffers and EGL surfaces remain unsupported. The finishing hook does not
+modify pixels: it queues the external wait and finishes a zero-draw frame so that
+shared TextureSync state is updated and flushed after the external write.
+Preparations abandoned before submission are paired with their acquire fence.
+
+The direct transfer writes the acquired DRM swapchain allocation rather than an
+intermediate image. It returns the current Vulkan copy fence to the normal DRM
+path. The existing swapchain slot owns KMS release/reuse eligibility; the engine's
+DMA-BUF reference does not replace that lease. There is no bridge-owned scanout
+ring, synthetic presentation element or delayed-frame scheduling.
+
+Only exact clipped original damage is copied. CPU/intermediate-path bounding-box
+merges and full-frame thresholds MUST NOT be used here: source staging outside the
+actual damage may belong to a different output. Unsupported targets retain the
+intermediate path; transient Vulkan resource failures do not permanently poison
+the target's capability cache. Direct mode currently requires Normal transform.
+
+Frame-local target completion is retained across flushes and target blits, including
+an empty final source frame. Source rendering resumes AFTER target operations so
+that another GPU's context is not left current. GLES blits also publish texture
+read/write synchronization. These fixes preserve both the final KMS fence and later
+capture/shared-context reads. Texture synchronization guards drop before the owned
+texture, including when caches were cleared while a framebuffer remained bound.
+
+### Direct-target validation before display adoption
+
+- Sixteen transfer/damage/lifecycle unit tests and two probe-model tests pass.
+- The niri workspace passes strict Clippy and 216 library regression tests.
+- No-Vulkan feature isolation and strict GLES/multigpu Clippy pass.
+- Offscreen direct-bound-target tests pass in 8-bit and 10-bit: 54 measured writes
+  per format, three original destinations, sparse/L-shaped/>3-rectangle/clipped
+  damage, exact unchanged pixels outside damage, shared-context cached-texture
+  reads before same-context capture, explicit GLES writes followed by direct writes,
+  blit-to with resumed producer drawing and pre-continuation snapshot, blit-from
+  followed by empty finish, and resize/invalidation.
+- The same direct-target test also passes 54 measured ten-bit writes at full-HD
+  base size (1920x1080 plus the mixed-size round), including shared-context reads
+  and post-blit producer continuation.
+- Trace events confirm direct Vulkan framebuffer submissions at the measured
+  direct stages; pixel success is not being used as a substitute for route proof.
+
+One failed early probe fixture submitted unbounded geometry directly to GLES while
+its oracle used clipped damage. The explicit-GLES fallback fixture was corrected
+to submit bounded geometry; out-of-bounds inputs remain in the MultiRenderer/direct
+clipping cases. Actual direct KMS display adoption is a separate remaining gate.

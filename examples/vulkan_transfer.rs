@@ -20,6 +20,11 @@
 //! the real renderer's route selection/fallbacks: pixel success alone does NOT prove Vulkan
 //! was used. Run with `RUST_LOG=smithay::backend::renderer::multigpu=debug` and inspect the
 //! successful Vulkan-copy route messages, including after each cache invalidation.
+//! Add `--multigpu --direct-target` to use three original target LINEAR dma-bufs instead of
+//! renderbuffers. This verifies exact outside-damage preservation (including L-shaped and
+//! >3-region damage), same-target GLES capture, fallback-to-direct transitions and MultiFrame
+//! blit flushes. Proof of the no-intermediate-blit route additionally requires the log message
+//! `submitted direct Vulkan framebuffer transfer`. This mode never activates scanout.
 
 use std::{
     error::Error,
@@ -43,8 +48,9 @@ use smithay::{
         drm::{DrmNode, NodeType},
         egl::{EGLContext, EGLDisplay},
         renderer::{
-            Bind, Color32F, ExportMem, Frame, ImportDma, Offscreen, Renderer, TextureMapping,
-            gles::{GlesRenderbuffer, GlesRenderer},
+            Bind, BlitFrame, Color32F, ExportMem, Frame, ImportDma, Offscreen, Renderer, TextureFilter,
+            TextureMapping,
+            gles::{GlesRenderbuffer, GlesRenderer, GlesTexture},
             multigpu::{ApiDevice, GpuManager, gbm::GbmGlesBackend, vkbridge::VkBridge},
             sync::SyncPoint,
         },
@@ -100,6 +106,9 @@ struct Args {
     /// Request SCANOUT|RENDERING destination allocations (still no KMS/display access).
     #[arg(long, conflicts_with = "multigpu")]
     scanout_candidate: bool,
+    /// Write three original target LINEAR dma-bufs via MultiRenderer; inspect direct-route logs.
+    #[arg(long, requires = "multigpu", conflicts_with = "scanout_candidate")]
+    direct_target: bool,
 }
 
 fn parse_modifier(value: &str) -> Result<u64, std::num::ParseIntError> {
@@ -230,29 +239,23 @@ fn paint<F: Frame>(
     Ok(())
 }
 
-fn verify(
+fn verify<T>(
     renderer: &mut GlesRenderer,
-    offscreen: &mut GlesRenderbuffer,
+    offscreen: &mut T,
     w: i32,
     h: i32,
     colors: &[usize; 4],
     release: &SyncPoint,
     frame: u32,
-) -> ProbeResult<()> {
+) -> ProbeResult<()>
+where
+    GlesRenderer: Bind<T>,
+{
     // This readback is deliberately delayed until AFTER the next Vulkan submission. Its
     // CPU wait therefore cannot accidentally replace that submission's destination-reader
     // dependency. No direct reading of the copied dma-buf is used as the test oracle.
     release.wait()?;
-    let target = renderer.bind(offscreen)?;
-    let mapping =
-        renderer.copy_framebuffer(&target, Rectangle::from_size((w, h).into()), Fourcc::Abgr8888)?;
-    if TextureMapping::format(&mapping) != Fourcc::Abgr8888 {
-        return Err("readback did not provide requested RGBA8 layout".into());
-    }
-    let bytes = renderer.map_texture(&mapping)?;
-    if bytes.len() != w as usize * h as usize * 4 {
-        return Err(format!("unexpected readback length {}", bytes.len()).into());
-    }
+    let bytes = capture(renderer, offscreen, w, h)?;
     // With Smithay's Normal GLES projection, buffer-coordinate y=0 is GL row zero.
     // Compare raw rows; mapping.flipped() describes reimport orientation, not a reason to
     // silently accept a vertically flipped transfer. Fourcc ABGR8888 is RGBA bytes on LE.
@@ -272,6 +275,25 @@ fn verify(
     }
     println!("PASS pixels frame={frame} size={w}x{h} (all pixels, RGBA tolerance=2)");
     Ok(())
+}
+
+// No fence wait is inserted here. Direct-target callers deliberately rely on MultiRenderer
+// having queued the external completion wait before this GLES readback of the SAME target.
+fn capture<T>(renderer: &mut GlesRenderer, target: &mut T, w: i32, h: i32) -> ProbeResult<Vec<u8>>
+where
+    GlesRenderer: Bind<T>,
+{
+    let target = renderer.bind(target)?;
+    let mapping =
+        renderer.copy_framebuffer(&target, Rectangle::from_size((w, h).into()), Fourcc::Abgr8888)?;
+    if TextureMapping::format(&mapping) != Fourcc::Abgr8888 {
+        return Err("readback did not provide requested RGBA8 layout".into());
+    }
+    let bytes = renderer.map_texture(&mapping)?;
+    if bytes.len() != w as usize * h as usize * 4 {
+        return Err(format!("unexpected readback length {}", bytes.len()).into());
+    }
+    Ok(bytes.to_vec())
 }
 
 fn run_size(
@@ -501,6 +523,574 @@ fn verify_multi_output(
     )
 }
 
+// Direct-target mode treats these dma-bufs as leased original output buffers. They are
+// retained across writes/captures and never submitted to KMS by this render-node-only probe.
+struct DirectOutput {
+    dmabuf: Dmabuf,
+    scratch: GlesRenderbuffer,
+    scratch_expected: Option<Vec<[u8; 4]>>,
+    shared_texture: Option<GlesTexture>,
+    shared_capture: GlesRenderbuffer,
+    width: i32,
+    height: i32,
+    expected: Vec<[u8; 4]>,
+    before: Vec<u8>,
+    damage: Vec<Rectangle<i32, Buffer>>,
+    release: SyncPoint,
+    blit_release: Option<SyncPoint>,
+}
+
+impl Drop for DirectOutput {
+    fn drop(&mut self) {
+        for release in std::iter::once(&self.release).chain(self.blit_release.as_ref()) {
+            while release.wait().is_err() {
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+fn rgba_color(rgba: [u8; 4]) -> Color32F {
+    Color32F::new(
+        rgba[0] as f32 / 255.,
+        rgba[1] as f32 / 255.,
+        rgba[2] as f32 / 255.,
+        rgba[3] as f32 / 255.,
+    )
+}
+
+fn clipped(rect: Rectangle<i32, Buffer>, width: i32, height: i32) -> Option<Rectangle<i32, Buffer>> {
+    let left = rect.loc.x.max(0);
+    let top = rect.loc.y.max(0);
+    let right = rect.loc.x.saturating_add(rect.size.w).min(width);
+    let bottom = rect.loc.y.saturating_add(rect.size.h).min(height);
+    (left < right && top < bottom)
+        .then(|| Rectangle::new((left, top).into(), (right - left, bottom - top).into()))
+}
+
+fn contains_pixel(rect: &Rectangle<i32, Buffer>, x: i32, y: i32) -> bool {
+    x >= rect.loc.x && y >= rect.loc.y && x < rect.loc.x + rect.size.w && y < rect.loc.y + rect.size.h
+}
+
+fn model_patch(
+    pixels: &mut [[u8; 4]],
+    width: i32,
+    height: i32,
+    rect: Rectangle<i32, Buffer>,
+    color: [u8; 4],
+) {
+    if let Some(rect) = clipped(rect, width, height) {
+        for y in rect.loc.y..rect.loc.y + rect.size.h {
+            for x in rect.loc.x..rect.loc.x + rect.size.w {
+                pixels[(y * width + x) as usize] = color;
+            }
+        }
+    }
+}
+
+fn direct_damage(width: i32, height: i32, sequence: u32) -> Vec<Rectangle<i32, Buffer>> {
+    let rect = |x, y, w, h| Rectangle::new((x, y).into(), (w, h).into());
+    match sequence % 4 {
+        0 => vec![
+            rect(width / 8, height / 8, width / 8, height / 8),
+            rect(width * 5 / 8, height * 5 / 8, width / 6, height / 6),
+        ],
+        // Touching L: merging these to a bounding rectangle destroys the valid inner gap.
+        1 => vec![
+            rect(width / 4, height / 4, width / 8, height / 2),
+            rect(width * 3 / 8, height * 5 / 8, width / 3, height / 8),
+        ],
+        // Five separated regions must NEVER become full-frame due to a CPU damage cap.
+        2 => (0..5)
+            .map(|i| {
+                rect(
+                    width * (2 * i + 1) / 12,
+                    if i % 2 == 0 { height / 6 } else { height * 2 / 3 },
+                    width / 16,
+                    height / 8,
+                )
+            })
+            .collect(),
+        // Include out-of-bounds input. Only clipped pixels are part of actual damage.
+        _ => vec![
+            rect(-width / 16, height / 3, width / 8, height / 8),
+            rect(width * 15 / 16, height * 3 / 4, width / 8, height / 8),
+            rect(width / 2, -height / 16, width / 8, height / 8),
+        ],
+    }
+}
+
+fn assert_direct_pixels(
+    output: &DirectOutput,
+    bytes: &[u8],
+    label: &str,
+    check_outside: bool,
+) -> ProbeResult<()> {
+    if bytes.len() != output.expected.len() * 4 {
+        return Err(format!("{label}: readback size mismatch").into());
+    }
+    let mut outside = 0;
+    for y in 0..output.height {
+        for x in 0..output.width {
+            let pixel = (y * output.width + x) as usize;
+            let actual = &bytes[pixel * 4..pixel * 4 + 4];
+            if check_outside && !output.damage.iter().any(|r| contains_pixel(r, x, y)) {
+                outside += 1;
+                if actual != &output.before[pixel * 4..pixel * 4 + 4] {
+                    return Err(format!(
+                        "{label}: OUTSIDE DAMAGE changed at ({x},{y}): was {:?}, now {actual:?}",
+                        &output.before[pixel * 4..pixel * 4 + 4]
+                    )
+                    .into());
+                }
+            }
+            let expected = output.expected[pixel];
+            if actual.iter().zip(expected).any(|(&a, e)| a.abs_diff(e) > 2) {
+                return Err(format!("{label}: pixel ({x},{y}) got {actual:?}, expected {expected:?}").into());
+            }
+        }
+    }
+    if check_outside && outside == 0 {
+        return Err(format!("{label}: test did not retain any outside-damage pixels").into());
+    }
+    println!("PASS {label}: all pixels, {outside} exact unchanged outside-damage pixels");
+    Ok(())
+}
+
+fn assert_blit_snapshot(output: &DirectOutput, bytes: &[u8]) -> ProbeResult<()> {
+    let expected = output
+        .scratch_expected
+        .as_ref()
+        .ok_or("pre-continuation blit model missing")?;
+    if bytes.len() != expected.len() * 4 {
+        return Err("blit snapshot size mismatch".into());
+    }
+    for (pixel, (actual, expected)) in bytes.chunks_exact(4).zip(expected).enumerate() {
+        if actual.iter().zip(expected).any(|(&a, &e)| a.abs_diff(e) > 2) {
+            return Err(format!(
+                "PRE-continuation blit snapshot pixel ({},{}) got {actual:?}, expected {expected:?}",
+                pixel % output.width as usize,
+                pixel / output.width as usize
+            )
+            .into());
+        }
+    }
+    println!("PASS blit_to PRE-continuation snapshot (not the final resumed target model)");
+    Ok(())
+}
+
+fn seed_direct_output(
+    manager: &mut MultiGpuManager,
+    target: &DrmNode,
+    output: &mut DirectOutput,
+    index: usize,
+) -> ProbeResult<()> {
+    let device = manager
+        .devices_mut()?
+        .find(|device| device.node() == target)
+        .ok_or("target missing")?;
+    let renderer = device.renderer_mut();
+    let colors = [[0, 1, 8, 9], [4, 5, 9, 8], [2, 3, 6, 7]][index];
+    let rects = quadrants(output.width, output.height);
+    let original = output.dmabuf.clone();
+    {
+        let mut framebuffer = renderer.bind(&mut output.dmabuf)?;
+        let prepared = renderer
+            .prepare_external_framebuffer_write(&mut framebuffer)?
+            .ok_or("GLES did not expose original dma-buf target")?;
+        if prepared.dmabuf != original {
+            return Err("GLES hook substituted a different allocation".into());
+        }
+        // No external write occurred: complete the mandatory pair with the acquire itself,
+        // so renderer-specific shared-texture synchronization is still correctly published.
+        renderer.finish_external_framebuffer_write(&mut framebuffer, &prepared.acquire)?;
+        let mut frame = renderer.render(
+            &mut framebuffer,
+            (output.width, output.height).into(),
+            Transform::Normal,
+        )?;
+        paint(&mut frame, &rects, &colors, None)?;
+        output.release = frame.finish()?;
+    }
+    {
+        let mut scratch = renderer.bind(&mut output.scratch)?;
+        if renderer
+            .prepare_external_framebuffer_write(&mut scratch)?
+            .is_some()
+        {
+            return Err("GLES exposed unsupported renderbuffer as external target".into());
+        }
+    }
+    {
+        // Cached/imported texture handles are NOT leased original framebuffer bindings.
+        // Bind<Dmabuf> above must expose Some; binding its cached GlesTexture must not.
+        let mut texture = renderer.import_dmabuf(&output.dmabuf, None)?;
+        output.shared_texture = Some(texture.clone());
+        let mut framebuffer = renderer.bind(&mut texture)?;
+        if renderer
+            .prepare_external_framebuffer_write(&mut framebuffer)?
+            .is_some()
+        {
+            return Err("GLES exposed ordinary texture binding as original dma-buf target".into());
+        }
+    }
+    for (rect, color) in rects.into_iter().zip(colors) {
+        model_patch(
+            &mut output.expected,
+            output.width,
+            output.height,
+            rect,
+            COLORS[color],
+        );
+    }
+    let bytes = capture(renderer, &mut output.dmabuf, output.width, output.height)?;
+    assert_direct_pixels(output, &bytes, "direct sentinel initialization", false)?;
+    output.before = bytes;
+    Ok(())
+}
+
+fn capture_shared_texture(renderer: &mut GlesRenderer, output: &mut DirectOutput) -> ProbeResult<Vec<u8>> {
+    {
+        let texture = output.shared_texture.as_ref().ok_or("shared texture missing")?;
+        let mut framebuffer = renderer.bind(&mut output.shared_capture)?;
+        let mut frame = renderer.render(
+            &mut framebuffer,
+            (output.width, output.height).into(),
+            Transform::Normal,
+        )?;
+        // No explicit completion wait on this OTHER context. The shared GlesTexture's
+        // TextureSync must observe the write fence published by the paired finish hook.
+        frame.render_texture_at(
+            texture,
+            (0, 0).into(),
+            1,
+            1.,
+            Transform::Normal,
+            &[Rectangle::from_size((output.width, output.height).into())],
+            &[],
+            1.,
+        )?;
+        let _read_completion = frame.finish()?;
+    }
+    capture(renderer, &mut output.shared_capture, output.width, output.height)
+}
+
+fn draw_direct_output(
+    manager: &mut MultiGpuManager,
+    source: &DrmNode,
+    target: &DrmNode,
+    format: Fourcc,
+    output: &mut DirectOutput,
+    sequence: u32,
+    index: usize,
+    warmup: bool,
+) -> ProbeResult<()> {
+    output.scratch_expected = None;
+    let damage = if warmup {
+        vec![Rectangle::from_size((output.width, output.height).into())]
+    } else {
+        direct_damage(output.width, output.height, sequence + index as u32)
+    };
+    let patches: Vec<_> = damage
+        .iter()
+        .enumerate()
+        .map(|(i, &rect)| {
+            let color = if i == 0 {
+                COLORS[8 + sequence as usize % 2]
+            } else {
+                COLORS[(index * 3 + sequence as usize + i) % COLORS.len()]
+            };
+            (rect, color)
+        })
+        .collect();
+    output.damage = damage
+        .iter()
+        .filter_map(|&r| clipped(r, output.width, output.height))
+        .collect();
+    for &(rect, color) in &patches {
+        model_patch(&mut output.expected, output.width, output.height, rect, color);
+    }
+    if !warmup && sequence % 6 == 2 {
+        // Exercise a target-GLES write followed by a later direct write without toggling
+        // manager policy: toggling resets engines, which would mask the following blit
+        // tests behind asynchronous initialization fallback instead of the direct route.
+        let device = manager
+            .devices_mut()?
+            .find(|device| device.node() == target)
+            .ok_or("target missing")?;
+        let renderer = device.renderer_mut();
+        let mut framebuffer = renderer.bind(&mut output.dmabuf)?;
+        let mut frame = renderer.render(
+            &mut framebuffer,
+            (output.width, output.height).into(),
+            Transform::Normal,
+        )?;
+        for &(rect, color) in &patches {
+            // This stage tests a bounded target-GLES write followed by direct
+            // access, not GLES's treatment of offscreen damage geometry. Keep
+            // its submitted geometry identical to the pixel oracle's clipped area.
+            let Some(rect) = clipped(rect, output.width, output.height) else {
+                continue;
+            };
+            let physical = Rectangle::<i32, Physical>::new(
+                (rect.loc.x, rect.loc.y).into(),
+                (rect.size.w, rect.size.h).into(),
+            );
+            frame.clear(rgba_color(color), &[physical])?;
+        }
+        output.release = frame.finish()?;
+        println!("TARGET_GLES_FALLBACK: explicit target draw, not a policy toggle or a Vulkan-route claim");
+        return Ok(());
+    }
+    let blit_to = !warmup && sequence % 6 == 3;
+    let blit_from = !warmup && sequence % 6 == 4;
+    if blit_from {
+        let device = manager
+            .devices_mut()?
+            .find(|device| device.node() == target)
+            .ok_or("target missing")?;
+        let renderer = device.renderer_mut();
+        let mut framebuffer = renderer.bind(&mut output.scratch)?;
+        let mut frame = renderer.render(
+            &mut framebuffer,
+            (output.width, output.height).into(),
+            Transform::Normal,
+        )?;
+        frame.clear(
+            rgba_color(COLORS[9]),
+            &[Rectangle::from_size((output.width, output.height).into())],
+        )?;
+        output.blit_release = Some(frame.finish()?);
+    }
+    let mut renderer = manager.renderer(source, target, format)?;
+    let mut framebuffer = renderer.bind(&mut output.dmabuf)?;
+    let mut scratch = renderer.bind(&mut output.scratch)?;
+    let mut frame = renderer.render(
+        &mut framebuffer,
+        (output.width, output.height).into(),
+        Transform::Normal,
+    )?;
+    for &(rect, color) in &patches {
+        let rect = Rectangle::<i32, Physical>::new(
+            (rect.loc.x, rect.loc.y).into(),
+            (rect.size.w, rect.size.h).into(),
+        );
+        frame.clear(rgba_color(color), &[rect])?;
+    }
+    if blit_to {
+        let full = Rectangle::<i32, Physical>::from_size((output.width, output.height).into());
+        output.blit_release = Some(frame.blit_to(&mut scratch, full, full, TextureFilter::Nearest)?);
+        // The scratch contains the state at the flush, BEFORE the resumed producer draw.
+        output.scratch_expected = Some(output.expected.clone());
+        println!("BLIT_TO direct-target: MultiFrame flush then capture PRE-continuation snapshot");
+        let rect = Rectangle::<i32, Buffer>::new(
+            (output.width * 3 / 4, output.height / 12).into(),
+            (output.width / 12, output.height / 10).into(),
+        );
+        let physical = Rectangle::<i32, Physical>::new(
+            (rect.loc.x, rect.loc.y).into(),
+            (rect.size.w, rect.size.h).into(),
+        );
+        let color = if sequence / 6 % 2 == 0 {
+            [240, 112, 16, 255]
+        } else {
+            [16, 176, 224, 255]
+        };
+        // This really draws on the source AFTER target-GLES blitting switched contexts.
+        // MultiFrame must restore its producer context and later flush only this new damage.
+        frame.clear(rgba_color(color), &[physical])?;
+        model_patch(&mut output.expected, output.width, output.height, rect, color);
+        output.damage.push(rect);
+        println!("PRODUCER_CONTINUATION after blit_to: distinct source patch {rect:?}");
+    }
+    if blit_from {
+        let rect = Rectangle::<i32, Buffer>::new(
+            (output.width / 3, output.height / 2).into(),
+            (output.width / 7, output.height / 7).into(),
+        );
+        let physical = Rectangle::<i32, Physical>::new(
+            (rect.loc.x, rect.loc.y).into(),
+            (rect.size.w, rect.size.h).into(),
+        );
+        output.blit_release = Some(frame.blit_from(&scratch, physical, physical, TextureFilter::Nearest)?);
+        model_patch(&mut output.expected, output.width, output.height, rect, COLORS[9]);
+        output.damage.push(rect);
+        println!(
+            "BLIT_FROM direct-target: MultiFrame flush then target GLES write; next frame must acquire it"
+        );
+    }
+    output.release = frame.finish()?;
+    if blit_from
+        && output
+            .blit_release
+            .as_ref()
+            .is_some_and(SyncPoint::contains_fence)
+        && !output.release.contains_fence()
+    {
+        return Err("empty MultiFrame finish discarded the retained target blit fence".into());
+    }
+    Ok(())
+}
+
+fn run_direct_targets(
+    manager: &mut MultiGpuManager,
+    source: &DrmNode,
+    target: &DrmNode,
+    args: &Args,
+) -> ProbeResult<()> {
+    manager.set_vulkan_direct_target_enabled(true);
+    let shared_context = {
+        let device = manager
+            .devices_mut()?
+            .find(|device| device.node() == target)
+            .ok_or("target missing")?;
+        let context = device.renderer().egl_context();
+        EGLContext::new_shared(context.display(), context)?
+    };
+    // The context is newly created in the target renderer's EGL share group and used only
+    // on this thread; no unrelated GL objects/state are supplied to GlesRenderer.
+    let mut shared_renderer = unsafe { GlesRenderer::new(shared_context) }?;
+    let format = Fourcc::from(args.format);
+    let base = (args.width as i32, args.height as i32);
+    let mixed = [base, (base.0 + 32, base.1 + 24), (base.0 + 16, base.1 + 8)];
+    println!(
+        "DIRECT-TARGET route proof requires 'submitted direct Vulkan framebuffer transfer' logs. Pixel PASS alone cannot distinguish fallback; no KMS access or scanout activation."
+    );
+    for (round, sizes) in [[base; 3], mixed, [base; 3]].into_iter().enumerate() {
+        if round != 0 {
+            println!("INVALIDATE direct-target caches round={round}");
+            manager.invalidate_caches()?;
+        }
+        let mut outputs = Vec::new();
+        for (width, height) in sizes {
+            let device = manager
+                .devices_mut()?
+                .find(|device| device.node() == target)
+                .ok_or("target missing")?;
+            let dmabuf =
+                device
+                    .allocator()
+                    .create_buffer(width as u32, height as u32, format, &[Modifier::Linear])?;
+            if dmabuf.format().modifier != Modifier::Linear
+                || dmabuf.format().code != format
+                || dmabuf.size().w != width
+                || dmabuf.size().h != height
+                || dmabuf.num_planes() != 1
+            {
+                return Err(
+                    "direct destination is not the requested original single-plane LINEAR descriptor".into(),
+                );
+            }
+            let scratch: GlesRenderbuffer =
+                Offscreen::create_buffer(device.renderer_mut(), format, (width, height).into())?;
+            let shared_capture: GlesRenderbuffer =
+                Offscreen::create_buffer(&mut shared_renderer, Fourcc::Abgr8888, (width, height).into())?;
+            outputs.push(DirectOutput {
+                dmabuf,
+                scratch,
+                scratch_expected: None,
+                shared_texture: None,
+                shared_capture,
+                width,
+                height,
+                expected: vec![[0; 4]; width as usize * height as usize],
+                before: Vec::new(),
+                damage: Vec::new(),
+                release: SyncPoint::signaled(),
+                blit_release: None,
+            });
+        }
+        let mut successes = 0;
+        let mut last_error = None;
+        for attempt in 0..20 {
+            match draw_direct_output(manager, source, target, format, &mut outputs[0], attempt, 0, true) {
+                Ok(()) => successes += 1,
+                Err(err) => {
+                    eprintln!("WARMUP direct-target round={round} attempt={attempt}: {err}");
+                    last_error = Some(err);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if successes == 0 {
+            return Err(last_error.unwrap_or_else(|| "direct-target warmup failed".into()));
+        }
+        {
+            // Exercise retained-target drop order: after cache invalidation the bound
+            // Texture may own the last Arc, so its sync guard must drop before that Arc.
+            // Do this BEFORE seeding/shared clones, otherwise they'd keep the texture alive.
+            let device = manager
+                .devices_mut()?
+                .find(|device| device.node() == target)
+                .ok_or("target missing")?;
+            let renderer = device.renderer_mut();
+            let mut framebuffer = renderer.bind(&mut outputs[0].dmabuf)?;
+            let prepared = renderer
+                .prepare_external_framebuffer_write(&mut framebuffer)?
+                .ok_or("bound dma-buf lost its external-write capability")?;
+            renderer.finish_external_framebuffer_write(&mut framebuffer, &prepared.acquire)?;
+            renderer.invalidate_caches()?;
+            drop(framebuffer);
+            println!("PASS retained dma-buf target drop after GLES cache invalidation");
+        }
+        for (index, output) in outputs.iter_mut().enumerate() {
+            seed_direct_output(manager, target, output, index)?;
+        }
+        for sequence in 0..args.frames {
+            let stage = match sequence % 6 {
+                2 => "explicit_target_gles_fallback",
+                3 => "direct_then_blit_to",
+                4 => "direct_then_blit_from",
+                _ => "direct_then_same_target_capture",
+            };
+            for (index, output) in outputs.iter_mut().enumerate() {
+                println!(
+                    "MEASURE direct-target round={round} output={index} sequence={sequence} stage={stage}"
+                );
+                draw_direct_output(manager, source, target, format, output, sequence, index, false)?;
+                println!(
+                    "SUBMIT direct-target round={round} output={index} sequence={sequence} exact_damage={:?} release_native={} complete_at_return={}",
+                    output.damage,
+                    output.release.is_exportable(),
+                    output.release.is_reached()
+                );
+            }
+            // Submit all three distinct targets before any CPU readback. Do NOT call wait
+            // here: capture must consume the wait queued by the direct integration itself.
+            for (index, output) in outputs.iter_mut().enumerate() {
+                // Read from a shared context FIRST. A same-context CPU readback here would
+                // complete the writer and could hide missing TextureSync publication.
+                let shared = capture_shared_texture(&mut shared_renderer, output)?;
+                assert_direct_pixels(output, &shared, "direct-target shared TextureSync reader", false)?;
+                let device = manager
+                    .devices_mut()?
+                    .find(|device| device.node() == target)
+                    .ok_or("target missing")?;
+                let renderer = device.renderer_mut();
+                let bytes = capture(renderer, &mut output.dmabuf, output.width, output.height)?;
+                assert_direct_pixels(
+                    output,
+                    &bytes,
+                    &format!("direct-target round={round} output={index} sequence={sequence}"),
+                    true,
+                )?;
+                if sequence % 6 == 3 {
+                    let scratch = capture(renderer, &mut output.scratch, output.width, output.height)?;
+                    assert_blit_snapshot(output, &scratch)?;
+                }
+                output.before = bytes;
+            }
+        }
+        manager.set_vulkan_direct_target_enabled(true);
+    }
+    println!(
+        "PASS DIRECT-TARGET PIXELS: {:?}, {} measured writes, 3 original targets, exact outside-damage preservation, capture, fallback/GLES, blit_to/from, resize/cache invalidation. Inspect direct-route logs; no scanout or validation-layer claim.",
+        args.format,
+        args.frames * 3 * 3
+    );
+    Ok(())
+}
+
 fn run_multigpu(
     source_node: DrmNode,
     source_file: File,
@@ -522,6 +1112,9 @@ fn run_multigpu(
         backend.add_node(node, gbm)?;
     }
     let mut manager = GpuManager::new(backend)?;
+    if args.direct_target {
+        return run_direct_targets(&mut manager, &source_node, &target_node, args);
+    }
     let format = Fourcc::from(args.format);
     let base = (args.width as i32, args.height as i32);
     let larger = (base.0 + 32, base.1 + 24);
@@ -624,6 +1217,55 @@ fn run_multigpu(
         args.frames * 2 * 3
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod direct_tests {
+    use super::*;
+
+    #[test]
+    fn direct_damage_keeps_holes_and_exceeds_cpu_rect_cap() {
+        let (width, height) = (192, 120);
+        let l_shape = direct_damage(width, height, 1);
+        assert_eq!(l_shape.len(), 2);
+        assert!(!l_shape.iter().any(|r| contains_pixel(r, 96, 40)));
+        let five = direct_damage(width, height, 2);
+        assert_eq!(five.len(), 5);
+        for shape in 0..4 {
+            let damage: Vec<_> = direct_damage(width, height, shape)
+                .into_iter()
+                .filter_map(|r| clipped(r, width, height))
+                .collect();
+            let changed = (0..height)
+                .flat_map(|y| (0..width).map(move |x| (x, y)))
+                .filter(|&(x, y)| damage.iter().any(|r| contains_pixel(r, x, y)))
+                .count();
+            assert!(changed > 0 && changed < (width * height) as usize);
+        }
+    }
+
+    #[test]
+    fn model_updates_only_exact_clipped_union() {
+        let (width, height) = (192, 120);
+        let before = COLORS[9];
+        let after = COLORS[8];
+        for shape in 0..4 {
+            let damage = direct_damage(width, height, shape);
+            let mut pixels = vec![before; (width * height) as usize];
+            for &rect in &damage {
+                model_patch(&mut pixels, width, height, rect, after);
+            }
+            for y in 0..height {
+                for x in 0..width {
+                    let changed = damage.iter().any(|r| contains_pixel(r, x, y));
+                    assert_eq!(
+                        pixels[(y * width + x) as usize],
+                        if changed { after } else { before }
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn main() -> ProbeResult<()> {

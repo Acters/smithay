@@ -396,6 +396,26 @@ pub trait RendererSuper: fmt::Debug {
         Self: 'frame;
 }
 
+/// An existing framebuffer allocation prepared for an external GPU write.
+///
+/// This retains the original dma-buf allocation, not an exported copy. It does not grant a
+/// swapchain/KMS buffer lease: the caller must separately own that lease and ensure all
+/// display and other external readers have released the allocation before writing.
+/// Wait [`Self::acquire`] before the external write. After submitting that write, pair the
+/// preparation with [`Renderer::finish_external_framebuffer_write`] on the SAME framebuffer
+/// and its completion fence before ANY later renderer use, including drawing, shared-context
+/// sampling, capture/readback or blitting. A plain [`Renderer::wait`] is insufficient when the
+/// renderer also tracks per-texture synchronization. If a later operation fails, retire the
+/// submitted external work before releasing the lease or reusing the buffer.
+#[must_use]
+#[derive(Debug)]
+pub struct ExternalFramebufferWrite {
+    /// Strong reference to the original framebuffer dma-buf; never an intermediate copy.
+    pub dmabuf: Dmabuf,
+    /// Orders prior operations on this renderer, not scanout or unrelated external readers.
+    pub acquire: SyncPoint,
+}
+
 /// Abstraction of commonly used rendering operations for compositors.
 ///
 /// *Note*: Associated types are defined in [`RendererSuper`].
@@ -432,6 +452,48 @@ pub trait Renderer: RendererSuper {
     ) -> Result<Self::Frame<'frame, 'buffer>, Self::Error>
     where
         'buffer: 'frame;
+
+    /// Prepare an original dma-buf-backed framebuffer for an external GPU write.
+    ///
+    /// Returns `None` when this renderer/target cannot expose its original allocation.
+    /// Implementations must not export a copy or silently substitute another allocation.
+    /// Preparation must preserve pixels and return an acquire fence ordering this renderer's
+    /// prior use. It may explicitly wait if it cannot produce such a fence asynchronously.
+    ///
+    /// The caller separately owns the framebuffer's buffer lease (including any KMS release
+    /// obligation), waits the returned acquire before writing, then MUST call the paired
+    /// [`Self::finish_external_framebuffer_write`] with the SAME framebuffer and external
+    /// completion BEFORE any later renderer access. A plain [`Self::wait`] does not substitute
+    /// for publishing the external write into renderer-specific shared-texture bookkeeping.
+    /// Errors after external submission do not release that obligation: retire submitted work
+    /// before buffer reuse or lease drop. If the write is abandoned before submission, pair
+    /// the preparation with its acquire fence as completion before resuming renderer access.
+    /// See [`ExternalFramebufferWrite`] for the complete ownership contract.
+    fn prepare_external_framebuffer_write(
+        &mut self,
+        _framebuffer: &mut Self::Framebuffer<'_>,
+    ) -> Result<Option<ExternalFramebufferWrite>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Complete a paired external write and publish it to this renderer's synchronization.
+    ///
+    /// Call this for the SAME framebuffer returned by a successful
+    /// [`Self::prepare_external_framebuffer_write`], before later renderer access. The default
+    /// queues/waits for `completion`; implementations with shared-texture state must also
+    /// publish a write dependency AFTER that wait. This is synchronization/bookkeeping ONLY:
+    /// implementations MUST NOT modify destination pixels or enqueue hidden framebuffer
+    /// writes. The original external completion may independently be handed to KMS, so it
+    /// must remain sufficient for pixel readiness without any extra renderer-write fence.
+    /// This does not release the caller's buffer lease or provide a KMS/display release.
+    /// On error after external submission, retire that submission before buffer/lease reuse.
+    fn finish_external_framebuffer_write(
+        &mut self,
+        _framebuffer: &mut Self::Framebuffer<'_>,
+        completion: &SyncPoint,
+    ) -> Result<(), Self::Error> {
+        self.wait(completion)
+    }
 
     /// Wait for a [`SyncPoint`] to be signaled
     fn wait(&mut self, sync: &sync::SyncPoint) -> Result<(), Self::Error>;

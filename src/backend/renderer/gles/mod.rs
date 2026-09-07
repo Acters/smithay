@@ -174,8 +174,14 @@ enum GlesTargetInternal<'a> {
         surface: &'a mut EGLSurface,
     },
     Texture {
-        texture: GlesTexture,
+        // Drop the guard BEFORE the retained texture. After cache invalidation this texture
+        // can be the last Arc, and its destructor itself takes the same RwLock. Declaration
+        // order is essential for the internally retained bind_texture guard's lifetime.
         sync_lock: RwLockWriteGuard<'a, TextureSync>,
+        texture: GlesTexture,
+        // Present ONLY when Bind<Dmabuf> attached this original allocation. Arbitrary
+        // textures (including separately imported clones) must not expose a dma-buf here.
+        dmabuf: Option<&'a mut Dmabuf>,
         fbo: ffi::types::GLuint,
         destruction_callback_sender: Sender<CleanupResource>,
     },
@@ -788,6 +794,7 @@ impl GlesRenderer {
 
             Ok(GlesTarget(GlesTargetInternal::Texture {
                 texture: texture.clone(),
+                dmabuf: None,
                 sync_lock,
                 destruction_callback_sender: self.gles_cleanup().sender.clone(),
                 fbo,
@@ -1545,12 +1552,15 @@ impl Bind<Dmabuf> for GlesRenderer {
                 return Err(GlesError::FramebufferBindingError);
             }
 
-            if let Ok(target) = self
+            if let Ok(mut target) = self
                 .bind_texture(&texture)
                 // SAFETY: The lifetime of the target only depends on the dmabuf,
                 // as the GlesTexture is cloned internally.
                 .map(|tex| unsafe { std::mem::transmute::<GlesTarget<'_>, GlesTarget<'a>>(tex) })
             {
+                if let GlesTargetInternal::Texture { dmabuf: original, .. } = &mut target.0 {
+                    *original = Some(dmabuf);
+                }
                 return Ok(target);
             }
 
@@ -1830,6 +1840,16 @@ impl Blit for GlesRenderer {
             },
         }
 
+        // Standalone blits do not pass through Frame::finish. Honor the existing texture
+        // dependencies here using the guards retained by each binding, not a second lock
+        // acquisition (which would deadlock against those guards).
+        if let GlesTargetInternal::Texture { sync_lock, .. } = &src_target.0 {
+            sync_lock.wait_for_upload(&self.gl);
+        }
+        if let GlesTargetInternal::Texture { sync_lock, .. } = &mut dst_target.0 {
+            sync_lock.wait_for_all(&self.gl);
+        }
+
         self.profiler.collect(&self.gl);
         let scope = self.profiler.scope(gpu_span_location!("blit"), &self.gl);
 
@@ -1886,9 +1906,18 @@ impl Blit for GlesRenderer {
         };
         drop(scope);
 
-        if errno == ffi::INVALID_OPERATION {
+        if errno != ffi::NO_ERROR {
             Err(GlesError::BlitError)
         } else {
+            // Publish both sides BEFORE export_sync_point flushes this context. Shared
+            // contexts sampling the destination (or writing the source) must observe the
+            // blit itself, not just an earlier external-copy/frame-finish dependency.
+            if let GlesTargetInternal::Texture { sync_lock, .. } = &src_target.0 {
+                sync_lock.update_read(&self.gl);
+            }
+            if let GlesTargetInternal::Texture { sync_lock, .. } = &mut dst_target.0 {
+                sync_lock.update_write(&self.gl);
+            }
             if let Some(sync_point) = self.export_sync_point() {
                 // Sync after glFlush in export_sync_point() and right before returning.
                 self.profiler.sync_gpu(&self.gl);
@@ -2305,6 +2334,50 @@ impl Renderer for GlesRenderer {
 
             gpu_span: Some(gpu_span),
         })
+    }
+
+    fn prepare_external_framebuffer_write(
+        &mut self,
+        framebuffer: &mut Self::Framebuffer<'_>,
+    ) -> Result<Option<super::ExternalFramebufferWrite>, Self::Error> {
+        let dmabuf = match &framebuffer.0 {
+            // Clone only the ORIGINAL allocation recorded by Bind<Dmabuf>. Its common
+            // texture-backed path must participate, but arbitrary Bind<GlesTexture> targets
+            // remain unsupported even when that texture happened to originate from a dma-buf.
+            GlesTargetInternal::Image { dmabuf, .. }
+            | GlesTargetInternal::Texture {
+                dmabuf: Some(dmabuf), ..
+            } => (**dmabuf).clone(),
+            _ => return Ok(None),
+        };
+        let size = dmabuf.size();
+        // No draw/clear: finishing a frame preserves all pixels and orders earlier GLES
+        // work. finish already exports an EGL fence or honestly falls back to glFinish.
+        let acquire = self
+            .render(framebuffer, (size.w, size.h).into(), Transform::Normal)?
+            .finish()?;
+        Ok(Some(super::ExternalFramebufferWrite { dmabuf, acquire }))
+    }
+
+    fn finish_external_framebuffer_write(
+        &mut self,
+        framebuffer: &mut Self::Framebuffer<'_>,
+        completion: &SyncPoint,
+    ) -> Result<(), Self::Error> {
+        self.wait(completion)?;
+        if matches!(
+            &framebuffer.0,
+            GlesTargetInternal::Image { .. } | GlesTargetInternal::Texture { dmabuf: Some(_), .. }
+        ) {
+            let size = framebuffer.size();
+            // Queue a NEW TextureSync write fence AFTER the external-completion wait and
+            // flush it through finish. Other shared EGL contexts must not observe only the
+            // earlier preparation fence. This performs no draw/clear and preserves pixels.
+            let _published = self
+                .render(framebuffer, (size.w, size.h).into(), Transform::Normal)?
+                .finish()?;
+        }
+        Ok(())
     }
 
     #[profiling::function]
