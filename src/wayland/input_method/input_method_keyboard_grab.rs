@@ -6,7 +6,6 @@ use std::{
 use wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_keyboard_grab_v2::{
     self, ZwpInputMethodKeyboardGrabV2,
 };
-use wayland_server::Dispatch;
 use wayland_server::backend::ClientId;
 
 use crate::input::{
@@ -18,11 +17,10 @@ use crate::input::{
 };
 use crate::wayland::text_input::TextInputHandle;
 use crate::{
-    backend::input::{KeyState, Keycode},
+    backend::input::{InputTime, KeyState, Keycode},
     utils::Serial,
+    wayland::Dispatch2,
 };
-
-use super::InputMethodManagerState;
 
 #[derive(Default, Debug)]
 pub(crate) struct InputMethodKeyboard {
@@ -48,14 +46,14 @@ where
         key_state: KeyState,
         modifiers: Option<ModifiersState>,
         serial: Serial,
-        time: u32,
+        time: InputTime,
     ) {
         let inner = self.inner.lock().unwrap();
         let keyboard = inner.grab.as_ref().unwrap();
         inner
             .text_input_handle
             .active_text_input_serial_or_default(serial.0, |serial| {
-                keyboard.key(serial, time, keycode.raw() - 8, key_state.into());
+                keyboard.key(serial, time.millis(), keycode.raw() - 8, key_state.into());
                 if let Some(serialized) = modifiers.map(|m| m.serialized) {
                     keyboard.modifiers(
                         serial,
@@ -100,25 +98,18 @@ impl<D: SeatHandler> fmt::Debug for InputMethodKeyboardUserData<D> {
     }
 }
 
-impl<D: SeatHandler + 'static> Dispatch<ZwpInputMethodKeyboardGrabV2, InputMethodKeyboardUserData<D>, D>
-    for InputMethodManagerState
-{
-    fn destroyed(
-        state: &mut D,
-        _client: ClientId,
-        _object: &ZwpInputMethodKeyboardGrabV2,
-        data: &InputMethodKeyboardUserData<D>,
-    ) {
-        data.handle.inner.lock().unwrap().grab = None;
-        data.keyboard_handle.unset_grab(state);
+impl<D: SeatHandler + 'static> Dispatch2<ZwpInputMethodKeyboardGrabV2, D> for InputMethodKeyboardUserData<D> {
+    fn destroyed(&self, state: &mut D, _client: ClientId, _object: &ZwpInputMethodKeyboardGrabV2) {
+        self.handle.inner.lock().unwrap().grab = None;
+        self.keyboard_handle.unset_grab(state);
     }
 
     fn request(
+        &self,
         _state: &mut D,
         _client: &wayland_server::Client,
         _resource: &ZwpInputMethodKeyboardGrabV2,
         request: zwp_input_method_keyboard_grab_v2::Request,
-        _data: &InputMethodKeyboardUserData<D>,
         _dhandle: &wayland_server::DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
     ) {

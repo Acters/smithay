@@ -20,15 +20,14 @@
 //! extern crate smithay;
 //!
 //! use smithay::wayland::pointer_gestures::PointerGesturesState;
-//! use smithay::delegate_pointer_gestures;
-//! # use smithay::backend::input::KeyState;
+//! # use smithay::backend::input::{InputTime, KeyState};
 //! # use smithay::input::{
 //! #   pointer::{PointerTarget, AxisFrame, MotionEvent, ButtonEvent, RelativeMotionEvent,
 //! #             GestureSwipeBeginEvent, GestureSwipeUpdateEvent, GestureSwipeEndEvent,
 //! #             GesturePinchBeginEvent, GesturePinchUpdateEvent, GesturePinchEndEvent,
 //! #             GestureHoldBeginEvent, GestureHoldEndEvent},
 //! #   keyboard::{KeyboardTarget, KeysymHandle, ModifiersState},
-//! #   touch::{DownEvent, UpEvent, MotionEvent as TouchMotionEvent, ShapeEvent, OrientationEvent, TouchTarget},
+//! #   touch::{DownEvent, UpEvent, MotionEvent as TouchMotionEvent, ShapeEvent, OrientationEvent, TouchTarget, FrameMarker},
 //! #   Seat, SeatHandler, SeatState,
 //! # };
 //! # use smithay::utils::{IsAlive, Serial};
@@ -45,7 +44,7 @@
 //! #   fn button(&self, seat: &Seat<State>, data: &mut State, event: &ButtonEvent) {}
 //! #   fn axis(&self, seat: &Seat<State>, data: &mut State, frame: AxisFrame) {}
 //! #   fn frame(&self, seat: &Seat<State>, data: &mut State) {}
-//! #   fn leave(&self, seat: &Seat<State>, data: &mut State, serial: Serial, time: u32) {}
+//! #   fn leave(&self, seat: &Seat<State>, data: &mut State, serial: Serial, time: InputTime) {}
 //! #   fn gesture_swipe_begin(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeBeginEvent) {}
 //! #   fn gesture_swipe_update(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeUpdateEvent) {}
 //! #   fn gesture_swipe_end(&self, seat: &Seat<State>, data: &mut State, event: &GestureSwipeEndEvent) {}
@@ -65,18 +64,19 @@
 //! #       key: KeysymHandle<'_>,
 //! #       state: KeyState,
 //! #       serial: Serial,
-//! #       time: u32,
+//! #       time: InputTime,
 //! #   ) {}
 //! #   fn modifiers(&self, seat: &Seat<State>, data: &mut State, modifiers: ModifiersState, serial: Serial) {}
 //! # }
 //! # impl TouchTarget<State> for Target {
-//! #   fn down(&self, seat: &Seat<State>, data: &mut State, event: &DownEvent, seq: Serial) {}
-//! #   fn up(&self, seat: &Seat<State>, data: &mut State, event: &UpEvent, seq: Serial) {}
-//! #   fn motion(&self, seat: &Seat<State>, data: &mut State, event: &TouchMotionEvent, seq: Serial) {}
-//! #   fn frame(&self, seat: &Seat<State>, data: &mut State, seq: Serial) {}
-//! #   fn cancel(&self, seat: &Seat<State>, data: &mut State, seq: Serial) {}
-//! #   fn shape(&self, seat: &Seat<State>, data: &mut State, event: &ShapeEvent, seq: Serial) {}
-//! #   fn orientation(&self, seat: &Seat<State>, data: &mut State, event: &OrientationEvent, seq: Serial) {}
+//! #   fn down(&self, seat: &Seat<State>, data: &mut State, event: &DownEvent) {}
+//! #   fn up(&self, seat: &Seat<State>, data: &mut State, event: &UpEvent) {}
+//! #   fn motion(&self, seat: &Seat<State>, data: &mut State, event: &TouchMotionEvent) {}
+//! #   fn frame(&self, seat: &Seat<State>, data: &mut State, marker: FrameMarker) {}
+//! #   fn cancel(&self, seat: &Seat<State>, data: &mut State, marker: FrameMarker) {}
+//! #   fn shape(&self, seat: &Seat<State>, data: &mut State, event: &ShapeEvent) {}
+//! #   fn orientation(&self, seat: &Seat<State>, data: &mut State, event: &OrientationEvent) {}
+//! #   fn last_frame(&self, seat: &Seat<State>, data: &mut State) -> Option<FrameMarker> { unimplemented!() }
 //! # }
 //! # struct State {
 //! #     seat_state: SeatState<Self>,
@@ -93,12 +93,12 @@
 //! # }
 //! let state = PointerGesturesState::new::<State>(&display.handle());
 //!
-//! delegate_pointer_gestures!(State);
+//! smithay::delegate_dispatch2!(State);
 //! ```
 
 use std::sync::{Arc, Mutex, atomic::Ordering};
 
-use atomic_float::AtomicF64;
+use portable_atomic::AtomicF64;
 use wayland_protocols::wp::pointer_gestures::zv1::server::{
     zwp_pointer_gesture_hold_v1::{self, ZwpPointerGestureHoldV1},
     zwp_pointer_gesture_pinch_v1::{self, ZwpPointerGesturePinchV1},
@@ -112,6 +112,7 @@ use wayland_server::{
 };
 
 use crate::{
+    backend::input::InputTime,
     input::{
         SeatHandler,
         pointer::{
@@ -121,7 +122,7 @@ use crate::{
         },
     },
     utils::{SERIAL_COUNTER, Serial},
-    wayland::seat::PointerUserData,
+    wayland::{Dispatch2, GlobalData, GlobalDispatch2, seat::PointerUserData},
 };
 
 const MANAGER_VERSION: u32 = 3;
@@ -146,13 +147,18 @@ impl WpPointerGesturePointerHandle {
         self.known_hold_gestures.lock().unwrap().push(gesture);
     }
 
-    pub(super) fn leave<D: SeatHandler + 'static>(&self, surface: &WlSurface, serial: Serial, time: u32) {
+    pub(super) fn leave<D: SeatHandler + 'static>(
+        &self,
+        surface: &WlSurface,
+        serial: Serial,
+        time: InputTime,
+    ) {
         self.for_each_focused_swipe_gesture(surface, |gesture| {
             let data = gesture.data::<PointerGestureUserData<D>>().unwrap();
             let ongoing = data.in_progress_on.lock().unwrap().take();
             if ongoing.is_some() {
                 // Cancel the ongoing gesture.
-                gesture.end(serial.into(), time, 1);
+                gesture.end(serial.into(), time.millis(), 1);
             }
         });
         self.for_each_focused_pinch_gesture(surface, |gesture| {
@@ -160,7 +166,7 @@ impl WpPointerGesturePointerHandle {
             let ongoing = data.in_progress_on.lock().unwrap().take();
             if ongoing.is_some() {
                 // Cancel the ongoing gesture.
-                gesture.end(serial.into(), time, 1);
+                gesture.end(serial.into(), time.millis(), 1);
             }
         });
         self.for_each_focused_hold_gesture(surface, |gesture| {
@@ -168,7 +174,7 @@ impl WpPointerGesturePointerHandle {
             let ongoing = data.in_progress_on.lock().unwrap().take();
             if ongoing.is_some() {
                 // Cancel the ongoing gesture.
-                gesture.end(serial.into(), time, 1);
+                gesture.end(serial.into(), time.millis(), 1);
             }
         });
     }
@@ -183,9 +189,9 @@ impl WpPointerGesturePointerHandle {
             let ongoing = data.in_progress_on.lock().unwrap().replace(surface.clone());
             if ongoing.is_some() {
                 // Cancel an ongoing gesture for a different surface.
-                gesture.end(event.serial.into(), event.time, 1);
+                gesture.end(event.serial.into(), event.time.millis(), 1);
             }
-            gesture.begin(event.serial.into(), event.time, surface, event.fingers);
+            gesture.begin(event.serial.into(), event.time.millis(), surface, event.fingers);
         });
     }
 
@@ -201,10 +207,10 @@ impl WpPointerGesturePointerHandle {
             if ongoing.as_ref() == Some(surface) {
                 let client_scale = data.client_scale.load(Ordering::Acquire);
                 let delta = event.delta.to_client(client_scale);
-                gesture.update(event.time, delta.x, delta.y);
+                gesture.update(event.time.millis(), delta.x, delta.y);
             } else if ongoing.take().is_some() {
                 // If it was for a different surface, cancel it.
-                gesture.end(SERIAL_COUNTER.next_serial().into(), event.time, 1);
+                gesture.end(SERIAL_COUNTER.next_serial().into(), event.time.millis(), 1);
             }
         });
     }
@@ -225,7 +231,7 @@ impl WpPointerGesturePointerHandle {
                     // If the gesture was ongoing for any other surface then cancel it.
                     true
                 };
-                gesture.end(event.serial.into(), event.time, cancelled.into());
+                gesture.end(event.serial.into(), event.time.millis(), cancelled.into());
             }
         });
     }
@@ -240,9 +246,9 @@ impl WpPointerGesturePointerHandle {
             let ongoing = data.in_progress_on.lock().unwrap().replace(surface.clone());
             if ongoing.is_some() {
                 // Cancel an ongoing gesture for a different surface.
-                gesture.end(event.serial.into(), event.time, 1);
+                gesture.end(event.serial.into(), event.time.millis(), 1);
             }
-            gesture.begin(event.serial.into(), event.time, surface, event.fingers);
+            gesture.begin(event.serial.into(), event.time.millis(), surface, event.fingers);
         });
     }
 
@@ -258,10 +264,10 @@ impl WpPointerGesturePointerHandle {
             if ongoing.as_ref() == Some(surface) {
                 let client_scale = data.client_scale.load(Ordering::Acquire);
                 let delta = event.delta.to_client(client_scale);
-                gesture.update(event.time, delta.x, delta.y, event.scale, event.rotation);
+                gesture.update(event.time.millis(), delta.x, delta.y, event.scale, event.rotation);
             } else if ongoing.take().is_some() {
                 // If it was for a different surface, cancel it.
-                gesture.end(SERIAL_COUNTER.next_serial().into(), event.time, 1);
+                gesture.end(SERIAL_COUNTER.next_serial().into(), event.time.millis(), 1);
             }
         });
     }
@@ -282,7 +288,7 @@ impl WpPointerGesturePointerHandle {
                     // If the gesture was ongoing for any other surface then cancel it.
                     true
                 };
-                gesture.end(event.serial.into(), event.time, cancelled.into());
+                gesture.end(event.serial.into(), event.time.millis(), cancelled.into());
             }
         });
     }
@@ -297,9 +303,9 @@ impl WpPointerGesturePointerHandle {
             let ongoing = data.in_progress_on.lock().unwrap().replace(surface.clone());
             if ongoing.is_some() {
                 // Cancel an ongoing gesture for a different surface.
-                gesture.end(event.serial.into(), event.time, 1);
+                gesture.end(event.serial.into(), event.time.millis(), 1);
             }
-            gesture.begin(event.serial.into(), event.time, surface, event.fingers);
+            gesture.begin(event.serial.into(), event.time.millis(), surface, event.fingers);
         });
     }
 
@@ -319,7 +325,7 @@ impl WpPointerGesturePointerHandle {
                     // If the gesture was ongoing for any other surface then cancel it.
                     true
                 };
-                gesture.end(event.serial.into(), event.time, cancelled.into());
+                gesture.end(event.serial.into(), event.time.millis(), cancelled.into());
             }
         });
     }
@@ -379,15 +385,15 @@ impl PointerGesturesState {
     /// Register new [ZwpPointerGesturesV1] global
     pub fn new<D>(display: &DisplayHandle) -> Self
     where
-        D: GlobalDispatch<ZwpPointerGesturesV1, ()>,
-        D: Dispatch<ZwpPointerGesturesV1, ()>,
+        D: GlobalDispatch<ZwpPointerGesturesV1, GlobalData>,
+        D: Dispatch<ZwpPointerGesturesV1, GlobalData>,
         D: Dispatch<ZwpPointerGestureSwipeV1, PointerGestureUserData<D>>,
         D: Dispatch<ZwpPointerGesturePinchV1, PointerGestureUserData<D>>,
         D: Dispatch<ZwpPointerGestureHoldV1, PointerGestureUserData<D>>,
         D: SeatHandler,
         D: 'static,
     {
-        let global = display.create_global::<D, ZwpPointerGesturesV1, _>(MANAGER_VERSION, ());
+        let global = display.create_global::<D, ZwpPointerGesturesV1, _>(MANAGER_VERSION, GlobalData);
 
         Self { global }
     }
@@ -398,9 +404,8 @@ impl PointerGesturesState {
     }
 }
 
-impl<D> Dispatch<ZwpPointerGesturesV1, (), D> for PointerGesturesState
+impl<D> Dispatch2<ZwpPointerGesturesV1, D> for GlobalData
 where
-    D: Dispatch<ZwpPointerGesturesV1, ()>,
     D: Dispatch<ZwpPointerGestureSwipeV1, PointerGestureUserData<D>>,
     D: Dispatch<ZwpPointerGesturePinchV1, PointerGestureUserData<D>>,
     D: Dispatch<ZwpPointerGestureHoldV1, PointerGestureUserData<D>>,
@@ -408,11 +413,11 @@ where
     D: 'static,
 {
     fn request(
+        &self,
         _state: &mut D,
         _client: &wayland_server::Client,
         _pointer_gestures: &ZwpPointerGesturesV1,
         request: zwp_pointer_gestures_v1::Request,
-        _data: &(),
         _dh: &DisplayHandle,
         data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
@@ -459,34 +464,33 @@ where
     }
 }
 
-impl<D> GlobalDispatch<ZwpPointerGesturesV1, (), D> for PointerGesturesState
+impl<D> GlobalDispatch2<ZwpPointerGesturesV1, D> for GlobalData
 where
-    D: GlobalDispatch<ZwpPointerGesturesV1, ()> + Dispatch<ZwpPointerGesturesV1, ()> + SeatHandler + 'static,
+    D: Dispatch<ZwpPointerGesturesV1, GlobalData> + SeatHandler + 'static,
 {
     fn bind(
+        &self,
         _state: &mut D,
         _dh: &DisplayHandle,
         _client: &Client,
         resource: New<ZwpPointerGesturesV1>,
-        _global_data: &(),
         data_init: &mut DataInit<'_, D>,
     ) {
-        data_init.init(resource, ());
+        data_init.init(resource, GlobalData);
     }
 }
 
-impl<D> Dispatch<ZwpPointerGestureSwipeV1, PointerGestureUserData<D>, D> for PointerGesturesState
+impl<D> Dispatch2<ZwpPointerGestureSwipeV1, D> for PointerGestureUserData<D>
 where
-    D: Dispatch<ZwpPointerGestureSwipeV1, PointerGestureUserData<D>>,
     D: SeatHandler,
     D: 'static,
 {
     fn request(
+        &self,
         _state: &mut D,
         _client: &wayland_server::Client,
         _gesture: &ZwpPointerGestureSwipeV1,
         request: zwp_pointer_gesture_swipe_v1::Request,
-        _data: &PointerGestureUserData<D>,
         _dh: &DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
@@ -496,13 +500,8 @@ where
         }
     }
 
-    fn destroyed(
-        _state: &mut D,
-        _: ClientId,
-        object: &ZwpPointerGestureSwipeV1,
-        data: &PointerGestureUserData<D>,
-    ) {
-        if let Some(ref handle) = data.handle {
+    fn destroyed(&self, _state: &mut D, _: ClientId, object: &ZwpPointerGestureSwipeV1) {
+        if let Some(ref handle) = self.handle {
             handle
                 .wp_pointer_gestures
                 .known_swipe_gestures
@@ -513,18 +512,17 @@ where
     }
 }
 
-impl<D> Dispatch<ZwpPointerGesturePinchV1, PointerGestureUserData<D>, D> for PointerGesturesState
+impl<D> Dispatch2<ZwpPointerGesturePinchV1, D> for PointerGestureUserData<D>
 where
-    D: Dispatch<ZwpPointerGesturePinchV1, PointerGestureUserData<D>>,
     D: SeatHandler,
     D: 'static,
 {
     fn request(
+        &self,
         _state: &mut D,
         _client: &wayland_server::Client,
         _gesture: &ZwpPointerGesturePinchV1,
         request: zwp_pointer_gesture_pinch_v1::Request,
-        _data: &PointerGestureUserData<D>,
         _dh: &DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
@@ -534,13 +532,8 @@ where
         }
     }
 
-    fn destroyed(
-        _state: &mut D,
-        _: ClientId,
-        object: &ZwpPointerGesturePinchV1,
-        data: &PointerGestureUserData<D>,
-    ) {
-        if let Some(ref handle) = data.handle {
+    fn destroyed(&self, _state: &mut D, _: ClientId, object: &ZwpPointerGesturePinchV1) {
+        if let Some(ref handle) = self.handle {
             handle
                 .wp_pointer_gestures
                 .known_pinch_gestures
@@ -551,18 +544,17 @@ where
     }
 }
 
-impl<D> Dispatch<ZwpPointerGestureHoldV1, PointerGestureUserData<D>, D> for PointerGesturesState
+impl<D> Dispatch2<ZwpPointerGestureHoldV1, D> for PointerGestureUserData<D>
 where
-    D: Dispatch<ZwpPointerGestureHoldV1, PointerGestureUserData<D>>,
     D: SeatHandler,
     D: 'static,
 {
     fn request(
+        &self,
         _state: &mut D,
         _client: &wayland_server::Client,
         _gesture: &ZwpPointerGestureHoldV1,
         request: zwp_pointer_gesture_hold_v1::Request,
-        _data: &PointerGestureUserData<D>,
         _dh: &DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
@@ -572,13 +564,8 @@ where
         }
     }
 
-    fn destroyed(
-        _state: &mut D,
-        _: ClientId,
-        object: &ZwpPointerGestureHoldV1,
-        data: &PointerGestureUserData<D>,
-    ) {
-        if let Some(ref handle) = data.handle {
+    fn destroyed(&self, _state: &mut D, _: ClientId, object: &ZwpPointerGestureHoldV1) {
+        if let Some(ref handle) = self.handle {
             handle
                 .wp_pointer_gestures
                 .known_hold_gestures
@@ -587,50 +574,4 @@ where
                 .retain(|p| p.id() != object.id());
         }
     }
-}
-
-/// Macro to delegate implementation of the pointer gestures protocol
-#[macro_export]
-macro_rules! delegate_pointer_gestures {
-    ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
-        const _: () = {
-            use $crate::{
-                reexports::{
-                    wayland_protocols::wp::pointer_gestures::zv1::server::{
-                        zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1,
-                        zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1,
-                        zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1,
-                        zwp_pointer_gestures_v1::ZwpPointerGesturesV1,
-                    },
-                    wayland_server::{delegate_dispatch, delegate_global_dispatch},
-                },
-                wayland::pointer_gestures::{PointerGestureUserData, PointerGesturesState},
-            };
-
-            delegate_global_dispatch!(
-                $(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)?
-                $ty: [ZwpPointerGesturesV1: ()] => PointerGesturesState
-            );
-
-            delegate_dispatch!(
-                $(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)?
-                $ty: [ZwpPointerGesturesV1: ()] => PointerGesturesState
-            );
-
-            delegate_dispatch!(
-                $(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)?
-                $ty: [ZwpPointerGestureSwipeV1: PointerGestureUserData<Self>] => PointerGesturesState
-            );
-
-            delegate_dispatch!(
-                $(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)?
-                $ty: [ZwpPointerGesturePinchV1: PointerGestureUserData<Self>] => PointerGesturesState
-            );
-
-            delegate_dispatch!(
-                $(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)?
-                $ty: [ZwpPointerGestureHoldV1: PointerGestureUserData<Self>] => PointerGesturesState
-            );
-        };
-    };
 }

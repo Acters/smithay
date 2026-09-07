@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex, atomic::Ordering};
 
-use atomic_float::AtomicF64;
+use portable_atomic::AtomicF64;
 use wayland_server::{
-    Client, Dispatch, DisplayHandle, Resource, Weak,
+    Client, DisplayHandle, Resource, Weak,
     backend::{ClientId, ObjectId},
     protocol::{
         wl_pointer::{
@@ -14,7 +14,7 @@ use wayland_server::{
 };
 
 use crate::{
-    backend::input::{Axis, AxisSource, ButtonState},
+    backend::input::{Axis, AxisSource, ButtonState, InputTime},
     input::{
         Seat,
         pointer::{
@@ -25,10 +25,13 @@ use crate::{
         },
     },
     utils::{Client as ClientCoords, Point, Serial, iter::new_locked_obj_iter_from_vec},
-    wayland::{compositor, pointer_constraints::with_pointer_constraint},
+    wayland::{
+        Dispatch2, compositor,
+        pointer_constraints::{ConstraintRemove, PointerConstraintsHandler, with_pointer_constraint},
+    },
 };
 
-use super::{SeatHandler, SeatState, WaylandFocus};
+use super::{SeatHandler, WaylandFocus};
 
 // Use to accumulate discrete values for `wl_pointer` < 8
 #[derive(Default)]
@@ -63,8 +66,27 @@ pub(crate) struct WlPointerHandle {
 }
 
 impl WlPointerHandle {
-    pub(super) fn new_pointer(&self, pointer: WlPointer) {
+    pub(super) fn new_pointer<D: SeatHandler + 'static>(&self, pointer: WlPointer)
+    where
+        <D as SeatHandler>::PointerFocus: WaylandFocus,
+    {
         self.known_pointers.lock().unwrap().push(pointer.downgrade());
+
+        let data = pointer.data::<PointerUserData<D>>().unwrap();
+        let guard = data.handle.as_ref().unwrap().inner.lock().unwrap();
+        if let Some((focus, location)) = &guard.focus {
+            if focus.same_client_as(&pointer.id()) {
+                if let Some(surface) = focus.wl_surface() {
+                    let serial = self.last_enter.lock().unwrap().unwrap();
+                    let client_scale = data.client_scale.load(Ordering::Acquire);
+                    let location = (guard.location - *location).to_client(client_scale);
+                    pointer.enter(serial.into(), &surface, location.x, location.y);
+                    if pointer.version() >= 5 {
+                        pointer.frame();
+                    }
+                }
+            }
+        }
     }
 
     fn enter<D: SeatHandler + 'static>(&self, surface: &WlSurface, event: &MotionEvent) {
@@ -81,7 +103,7 @@ impl WlPointerHandle {
         })
     }
 
-    fn leave(&self, surface: &WlSurface, serial: Serial, _time: u32) {
+    fn leave(&self, surface: &WlSurface, serial: Serial, _time: InputTime) {
         self.for_each_focused_pointer(surface, |ptr| {
             ptr.leave(serial.into(), surface);
             if ptr.version() >= 5 {
@@ -100,13 +122,18 @@ impl WlPointerHandle {
                 .client_scale
                 .load(Ordering::Acquire);
             let location = event.location.to_client(client_scale);
-            ptr.motion(event.time, location.x, location.y);
+            ptr.motion(event.time.millis(), location.x, location.y);
         })
     }
 
     fn button(&self, surface: &WlSurface, event: &ButtonEvent) {
         self.for_each_focused_pointer(surface, |ptr| {
-            ptr.button(event.serial.into(), event.time, event.button, event.state.into());
+            ptr.button(
+                event.serial.into(),
+                event.time.millis(),
+                event.button,
+                event.state.into(),
+            );
         })
     }
 
@@ -161,7 +188,7 @@ impl WlPointerHandle {
                 }
                 // stop
                 if details.stop.0 {
-                    ptr.axis_stop(details.time, WlAxis::HorizontalScroll);
+                    ptr.axis_stop(details.time.millis(), WlAxis::HorizontalScroll);
 
                     compositor::with_states(surface, |states| {
                         if let Some(data) = states.data_map.get::<Mutex<V120UserData>>() {
@@ -170,7 +197,7 @@ impl WlPointerHandle {
                     });
                 }
                 if details.stop.1 {
-                    ptr.axis_stop(details.time, WlAxis::VerticalScroll);
+                    ptr.axis_stop(details.time.millis(), WlAxis::VerticalScroll);
 
                     compositor::with_states(surface, |states| {
                         if let Some(data) = states.data_map.get::<Mutex<V120UserData>>() {
@@ -193,7 +220,7 @@ impl WlPointerHandle {
                     );
                 }
                 ptr.axis(
-                    details.time,
+                    details.time.millis(),
                     WlAxis::HorizontalScroll,
                     details.axis.0 * client_scale,
                 );
@@ -203,7 +230,7 @@ impl WlPointerHandle {
                     ptr.axis_relative_direction(WlAxis::VerticalScroll, details.relative_direction.1.into());
                 }
                 ptr.axis(
-                    details.time,
+                    details.time.millis(),
                     WlAxis::VerticalScroll,
                     details.axis.1 * client_scale,
                 );
@@ -235,7 +262,9 @@ impl WlPointerHandle {
 
 impl<D> PointerTarget<D> for WlSurface
 where
-    D: SeatHandler + 'static,
+    D: SeatHandler,
+    D: PointerConstraintsHandler,
+    D: 'static,
 {
     fn enter(&self, seat: &Seat<D>, _data: &mut D, event: &MotionEvent) {
         if let Some(pointer) = seat.get_pointer() {
@@ -243,16 +272,26 @@ where
         }
     }
 
-    fn leave(&self, seat: &Seat<D>, _data: &mut D, serial: Serial, time: u32) {
+    fn leave(&self, seat: &Seat<D>, data: &mut D, serial: Serial, time: InputTime) {
         if let Some(pointer) = seat.get_pointer() {
             pointer.wp_pointer_gestures.leave::<D>(self, serial, time);
             pointer.wl_pointer.leave(self, serial, time);
 
-            with_pointer_constraint(self, &pointer, |constraint| {
+            if let Some(region) = with_pointer_constraint(self, &pointer, |constraint| {
                 if let Some(constraint) = constraint {
-                    constraint.deactivate();
+                    if constraint.is_active() {
+                        let region = constraint.region().cloned();
+                        constraint.deactivate();
+                        Some(region)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
                 }
-            });
+            }) {
+                data.remove_constraint(self, &pointer, ConstraintRemove::PointerLeave(region));
+            }
         }
 
         compositor::with_states(self, |states| {
@@ -348,19 +387,18 @@ pub struct PointerUserData<D: SeatHandler> {
     pub(crate) client_scale: Arc<AtomicF64>,
 }
 
-impl<D> Dispatch<WlPointer, PointerUserData<D>, D> for SeatState<D>
+impl<D> Dispatch2<WlPointer, D> for PointerUserData<D>
 where
-    D: Dispatch<WlPointer, PointerUserData<D>>,
     D: SeatHandler,
     <D as SeatHandler>::PointerFocus: WaylandFocus,
     D: 'static,
 {
     fn request(
+        &self,
         state: &mut D,
         _client: &wayland_server::Client,
         pointer: &WlPointer,
         request: wl_pointer::Request,
-        data: &PointerUserData<D>,
         _dh: &DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
@@ -371,7 +409,7 @@ where
                 hotspot_x,
                 hotspot_y,
             } => {
-                let handle = match &data.handle {
+                let handle = match &self.handle {
                     Some(handle) => handle,
                     None => return,
                 };
@@ -437,8 +475,8 @@ where
         };
     }
 
-    fn destroyed(_state: &mut D, _: ClientId, pointer: &WlPointer, data: &PointerUserData<D>) {
-        if let Some(ref handle) = data.handle {
+    fn destroyed(&self, _state: &mut D, _: ClientId, pointer: &WlPointer) {
+        if let Some(ref handle) = self.handle {
             handle
                 .wl_pointer
                 .known_pointers

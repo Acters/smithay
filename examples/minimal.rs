@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use ::winit::platform::pump_events::PumpStatus;
+use ::winit::event_loop::pump_events::PumpStatus;
 use smithay::{
     backend::{
-        input::{InputEvent, KeyboardKeyEvent},
+        input::{InputEvent, InputTime, KeyboardKeyEvent},
         renderer::{
             Color32F, Frame, Renderer,
             element::{
@@ -15,7 +15,6 @@ use smithay::{
         },
         winit::{self, WinitEvent},
     },
-    delegate_compositor, delegate_data_device, delegate_seat, delegate_shm, delegate_xdg_shell,
     input::{Seat, SeatHandler, SeatState, keyboard::FilterResult},
     reexports::wayland_server::{Display, protocol::wl_seat},
     utils::{Rectangle, Serial, Transform},
@@ -25,6 +24,7 @@ use smithay::{
             CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes, TraversalAction,
             with_surface_tree_downward,
         },
+        pointer_constraints::PointerConstraintsHandler,
         selection::{
             SelectionHandler,
             data_device::{DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler},
@@ -117,6 +117,8 @@ impl SeatHandler for App {
     fn cursor_image(&mut self, _seat: &Seat<Self>, _image: smithay::input::pointer::CursorImageStatus) {}
 }
 
+impl PointerConstraintsHandler for App {}
+
 struct App {
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
@@ -179,7 +181,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
                         event.key_code(),
                         event.state(),
                         0.into(),
-                        0,
+                        InputTime::now(),
                         |_, _, _| {
                             //
                             FilterResult::Forward
@@ -290,9 +292,4 @@ impl ClientData for ClientState {
     }
 }
 
-// Macros used to delegate protocol handling to types in the app state.
-delegate_xdg_shell!(App);
-delegate_compositor!(App);
-delegate_shm!(App);
-delegate_seat!(App);
-delegate_data_device!(App);
+smithay::delegate_dispatch2!(App);

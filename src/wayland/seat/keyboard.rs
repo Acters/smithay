@@ -2,7 +2,7 @@ use std::{cell::RefCell, fmt};
 
 use tracing::{instrument, trace, warn};
 use wayland_server::{
-    Client, Dispatch, DisplayHandle, Resource,
+    Client, DisplayHandle, Resource,
     backend::{ClientId, ObjectId},
     protocol::{
         wl_keyboard::{self, KeyState as WlKeyState, WlKeyboard},
@@ -12,13 +12,14 @@ use wayland_server::{
 
 use super::WaylandFocus;
 use crate::{
-    backend::input::{KeyState, Keycode},
+    backend::input::{InputTime, KeyState, Keycode},
     input::{
-        Seat, SeatHandler, SeatState, WeakSeat,
+        Seat, SeatHandler, WeakSeat,
         keyboard::{KeyboardHandle, KeyboardTarget, KeysymHandle, ModifiersState},
     },
     utils::{HookId, Serial, iter::new_locked_obj_iter_from_vec},
     wayland::{
+        Dispatch2,
         compositor::{add_destruction_hook, remove_destruction_hook, with_states},
         input_method::InputMethodSeat,
         text_input::TextInputSeat,
@@ -116,24 +117,24 @@ impl<D: SeatHandler> fmt::Debug for KeyboardUserData<D> {
     }
 }
 
-impl<D> Dispatch<WlKeyboard, KeyboardUserData<D>, D> for SeatState<D>
+impl<D> Dispatch2<WlKeyboard, D> for KeyboardUserData<D>
 where
-    D: 'static + Dispatch<WlKeyboard, KeyboardUserData<D>>,
+    D: 'static,
     D: SeatHandler,
 {
     fn request(
+        &self,
         _state: &mut D,
         _client: &wayland_server::Client,
         _resource: &WlKeyboard,
         _request: wl_keyboard::Request,
-        _data: &KeyboardUserData<D>,
         _dhandle: &DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
     }
 
-    fn destroyed(_state: &mut D, _client_id: ClientId, keyboard: &WlKeyboard, data: &KeyboardUserData<D>) {
-        if let Some(ref handle) = data.handle {
+    fn destroyed(&self, _state: &mut D, _client_id: ClientId, keyboard: &WlKeyboard) {
+        if let Some(ref handle) = self.handle {
             handle
                 .arc
                 .known_kbds
@@ -252,8 +253,9 @@ pub(crate) fn enter_internal<D: SeatHandler + 'static>(
     // text-input global bound due to clients doing lazy global binding.
     text_input.set_focus(Some(surface.clone()));
 
-    // Only notify on `enter` once we have an actual IME.
-    if input_method.has_instance() {
+    // Notify on `enter` once we have an actual IME, or while the compositor is itself acting
+    // as the input method for this seat.
+    if input_method.has_instance() || text_input.compositor_input_method() {
         text_input.enter();
     }
 }
@@ -280,6 +282,9 @@ impl<D: SeatHandler + 'static> KeyboardTarget<D> for WlSurface {
 
         if input_method.has_instance() {
             input_method.deactivate_input_method(state);
+        }
+        // Send `leave` for a real IME or while the compositor is acting as the input method.
+        if input_method.has_instance() || text_input.compositor_input_method() {
             text_input.leave();
         }
 
@@ -293,10 +298,15 @@ impl<D: SeatHandler + 'static> KeyboardTarget<D> for WlSurface {
         key: KeysymHandle<'_>,
         state: KeyState,
         serial: Serial,
-        time: u32,
+        time: InputTime,
     ) {
         for_each_focused_kbds(seat, self, |kbd| {
-            kbd.key(serial.into(), time, key.raw_code().raw() - 8, state.into())
+            kbd.key(
+                serial.into(),
+                time.millis(),
+                key.raw_code().raw() - 8,
+                state.into(),
+            )
         })
     }
 

@@ -6,7 +6,7 @@ use std::{
 use crate::{
     drawing::*,
     render::*,
-    state::{AnvilState, Backend, take_presentation_feedback},
+    state::{AnvilState, Backend, take_presentation_feedback, update_primary_scanout_output},
 };
 #[cfg(feature = "egl")]
 use smithay::backend::renderer::ImportEgl;
@@ -28,7 +28,6 @@ use smithay::{
         vulkan::{Instance, PhysicalDevice, version::Version},
         x11::{WindowBuilder, X11Backend, X11Event, X11Surface},
     },
-    delegate_dmabuf,
     input::{
         keyboard::LedState,
         pointer::{CursorImageAttributes, CursorImageStatus},
@@ -83,7 +82,6 @@ impl DmabufHandler for AnvilState<X11Data> {
         }
     }
 }
-delegate_dmabuf!(AnvilState<X11Data>);
 
 impl Backend for X11Data {
     fn seat_name(&self) -> String {
@@ -416,6 +414,15 @@ pub fn run_x11() {
                     };
 
                     let states = render_output_result.states;
+
+                    update_primary_scanout_output(
+                        &state.space,
+                        &output,
+                        &state.dnd_icon,
+                        &state.cursor_status,
+                        &states,
+                    );
+
                     #[cfg(feature = "debug")]
                     let rendered = render_output_result.damage.is_some();
                     if render_output_result.damage.is_some() {

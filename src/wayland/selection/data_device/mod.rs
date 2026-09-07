@@ -27,11 +27,12 @@
 //! ```
 //! # extern crate wayland_server;
 //! # #[macro_use] extern crate smithay;
-//! use smithay::delegate_data_device;
+//! # use smithay::wayland::compositor::{CompositorHandler, CompositorState, CompositorClientState};
 //! use smithay::wayland::selection::SelectionHandler;
 //! use smithay::wayland::selection::data_device::{WaylandDndGrabHandler, DataDeviceState, DataDeviceHandler};
 //! # use smithay::input::{Seat, SeatState, SeatHandler, pointer::CursorImageStatus};
 //! # use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+//! # use smithay::wayland::pointer_constraints::PointerConstraintsHandler;
 //!
 //! # struct State { data_device_state: DataDeviceState }
 //! # let mut display = wayland_server::Display::<State>::new().unwrap();
@@ -44,6 +45,11 @@
 //! // ..
 //!
 //! // implement the necessary traits
+//! # impl CompositorHandler for State {
+//! #     fn compositor_state(&mut self) -> &mut CompositorState { unimplemented!() }
+//! #     fn client_compositor_state<'a>(&self, client: &'a wayland_server::Client) -> &'a CompositorClientState { unimplemented!() }
+//! #     fn commit(&mut self, surface: &wayland_server::protocol::wl_surface::WlSurface) {}
+//! # }
 //! # impl SeatHandler for State {
 //! #     type KeyboardFocus = WlSurface;
 //! #     type PointerFocus = WlSurface;
@@ -52,6 +58,7 @@
 //! #     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) { unimplemented!() }
 //! #     fn cursor_image(&mut self, seat: &Seat<Self>, image: CursorImageStatus) { unimplemented!() }
 //! # }
+//! # impl PointerConstraintsHandler for State {}
 //! impl WaylandDndGrabHandler for State {
 //!     // ... implement `dnd_requested` to handle drag&drop operations
 //! }
@@ -62,7 +69,8 @@
 //!     fn data_device_state(&mut self) -> &mut DataDeviceState { &mut self.data_device_state }
 //!     // ... override default implementations here to customize handling ...
 //! }
-//! delegate_data_device!(State);
+//!
+//! smithay::delegate_dispatch2!(State);
 //!
 //! // You're now ready to go!
 //! ```
@@ -89,11 +97,13 @@ use wayland_server::{
 };
 
 use crate::{
+    backend::input::InputTime,
     input::{
         Seat, SeatHandler,
         dnd::{DndAction, DndFocus, GrabType, OfferData, Source},
     },
     utils::{Logical, Point, Serial},
+    wayland::GlobalData,
 };
 
 mod device;
@@ -249,13 +259,13 @@ fn handle_dnd<D, S>(
     match request {
         Request::Accept { mime_type, .. } => {
             if let Some(source) = source.as_ref() {
-                if let Some(mtype) = mime_type {
-                    data.accepted = source
+                data.accepted = match &mime_type {
+                    Some(mtype) => source
                         .metadata()
-                        .is_some_and(|meta| meta.mime_types.contains(&mtype));
-                } else {
-                    data.accepted = false;
-                }
+                        .is_some_and(|meta| meta.mime_types.contains(mtype)),
+                    None => false,
+                };
+                source.accepted(mime_type);
             } else if data.finished {
                 offer.post_error(
                     wl_data_offer::Error::InvalidFinish,
@@ -349,7 +359,9 @@ fn handle_dnd<D, S>(
                 );
                 if chosen_action != data.chosen_action {
                     data.chosen_action = chosen_action;
-                    offer.action(chosen_action);
+                    if offer.version() >= wl_data_offer::EVT_ACTION_SINCE {
+                        offer.action(chosen_action);
+                    }
                     source.choose_action(
                         DndAction::unwrap_single(&DndAction::vec_from_wl(chosen_action))
                             .expect("We have selected a single value at this point."),
@@ -466,7 +478,9 @@ impl<D: SeatHandler + DataDeviceHandler + 'static> DndFocus<D> for WlSurface {
                 for mime_type in metadata.mime_types.iter().cloned() {
                     offer.offer(mime_type);
                 }
-                offer.source_actions(DndAction::convert_slice(&metadata.dnd_actions));
+                if offer.version() >= wl_data_offer::EVT_SOURCE_ACTIONS_SINCE {
+                    offer.source_actions(DndAction::convert_slice(&metadata.dnd_actions));
+                }
 
                 device.enter((*serial).into(), self, location.x, location.y, Some(&offer));
 
@@ -490,7 +504,7 @@ impl<D: SeatHandler + DataDeviceHandler + 'static> DndFocus<D> for WlSurface {
         offer: Option<&mut WlOfferData<S>>,
         seat: &Seat<D>,
         location: Point<f64, Logical>,
-        time: u32,
+        time: InputTime,
     ) {
         let seat_data = seat
             .user_data()
@@ -502,7 +516,9 @@ impl<D: SeatHandler + DataDeviceHandler + 'static> DndFocus<D> for WlSurface {
             if let Some(new_metadata) = offer.source.metadata() {
                 if offer.last_source_actions != new_metadata.dnd_actions {
                     for wl_offer in &offer.wl_offers {
-                        wl_offer.source_actions(DndAction::convert_slice(&new_metadata.dnd_actions));
+                        if wl_offer.version() >= wl_data_offer::EVT_SOURCE_ACTIONS_SINCE {
+                            wl_offer.source_actions(DndAction::convert_slice(&new_metadata.dnd_actions));
+                        }
                     }
 
                     offer.last_source_actions = new_metadata.dnd_actions;
@@ -512,7 +528,7 @@ impl<D: SeatHandler + DataDeviceHandler + 'static> DndFocus<D> for WlSurface {
 
         for device in seat_data.known_data_devices() {
             if device.id().same_client_as(&self.id()) {
-                device.motion(time, location.x, location.y);
+                device.motion(time.millis(), location.x, location.y);
             }
         }
     }
@@ -566,10 +582,10 @@ impl DataDeviceState {
     /// Regiseter new [WlDataDeviceManager] global
     pub fn new<D>(display: &DisplayHandle) -> Self
     where
-        D: GlobalDispatch<WlDataDeviceManager, ()> + 'static,
+        D: GlobalDispatch<WlDataDeviceManager, GlobalData> + 'static,
         D: DataDeviceHandler,
     {
-        let manager_global = display.create_global::<D, WlDataDeviceManager, _>(3, ());
+        let manager_global = display.create_global::<D, WlDataDeviceManager, _>(3, GlobalData);
 
         Self {
             manager_global,
@@ -745,7 +761,7 @@ mod handlers {
 
     use tracing::error;
     use wayland_server::{
-        Dispatch, DisplayHandle, GlobalDispatch,
+        Dispatch, DisplayHandle,
         protocol::{
             wl_data_device::WlDataDevice,
             wl_data_device_manager::{self, WlDataDeviceManager},
@@ -756,46 +772,45 @@ mod handlers {
     use crate::{
         input::Seat,
         wayland::selection::{device::SelectionDevice, seat_data::SeatData},
+        wayland::{Dispatch2, GlobalData, GlobalDispatch2},
     };
 
-    use super::{DataDeviceHandler, DataDeviceState};
+    use super::DataDeviceHandler;
     use super::{device::DataDeviceUserData, source::DataSourceUserData};
 
-    impl<D> GlobalDispatch<WlDataDeviceManager, (), D> for DataDeviceState
+    impl<D> GlobalDispatch2<WlDataDeviceManager, D> for GlobalData
     where
-        D: GlobalDispatch<WlDataDeviceManager, ()>,
-        D: Dispatch<WlDataDeviceManager, ()>,
+        D: Dispatch<WlDataDeviceManager, GlobalData>,
         D: Dispatch<WlDataSource, DataSourceUserData>,
         D: Dispatch<WlDataDevice, DataDeviceUserData>,
         D: DataDeviceHandler,
         D: 'static,
     {
         fn bind(
+            &self,
             _state: &mut D,
             _handle: &DisplayHandle,
             _client: &wayland_server::Client,
             resource: wayland_server::New<WlDataDeviceManager>,
-            _global_data: &(),
             data_init: &mut wayland_server::DataInit<'_, D>,
         ) {
-            data_init.init(resource, ());
+            data_init.init(resource, GlobalData);
         }
     }
 
-    impl<D> Dispatch<WlDataDeviceManager, (), D> for DataDeviceState
+    impl<D> Dispatch2<WlDataDeviceManager, D> for GlobalData
     where
-        D: Dispatch<WlDataDeviceManager, ()>,
         D: Dispatch<WlDataSource, DataSourceUserData>,
         D: Dispatch<WlDataDevice, DataDeviceUserData>,
         D: DataDeviceHandler,
         D: 'static,
     {
         fn request(
+            &self,
             _state: &mut D,
             client: &wayland_server::Client,
             _resource: &WlDataDeviceManager,
             request: wl_data_device_manager::Request,
-            _data: &(),
             dhandle: &DisplayHandle,
             data_init: &mut wayland_server::DataInit<'_, D>,
         ) {
@@ -828,43 +843,4 @@ mod handlers {
             }
         }
     }
-}
-
-#[allow(missing_docs)] // TODO
-#[macro_export]
-macro_rules! delegate_data_device {
-    ($(@<$( $lt:tt $( : $clt:tt $(+ $dlt:tt )* )? ),+>)? $ty: ty) => {
-        const _: () = {
-            use $crate::{
-                reexports::wayland_server::{
-                    delegate_dispatch, delegate_global_dispatch,
-                    protocol::{
-                        wl_data_device::WlDataDevice, wl_data_device_manager::WlDataDeviceManager,
-                        wl_data_source::WlDataSource,
-                    },
-                },
-                wayland::selection::data_device::{DataDeviceState, DataDeviceUserData, DataSourceUserData},
-            };
-
-            delegate_global_dispatch!(
-                $(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)?
-                $ty: [WlDataDeviceManager: ()] => DataDeviceState
-            );
-
-            delegate_dispatch!(
-                $(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)?
-                $ty: [WlDataDeviceManager: ()] => DataDeviceState
-            );
-
-            delegate_dispatch!(
-                $(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)?
-                $ty: [WlDataDevice: DataDeviceUserData] => DataDeviceState
-            );
-
-            delegate_dispatch!(
-                $(@< $( $lt $( : $clt $(+ $dlt )* )? ),+ >)?
-                $ty: [WlDataSource: DataSourceUserData] => DataDeviceState
-            );
-        };
-    };
 }
