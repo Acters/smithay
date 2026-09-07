@@ -1,7 +1,7 @@
 # Same-frame Vulkan transfer engine
 
-This describes the experimental `nvidia-intel-bridge-transfer-engine` branch. The
-previous implementation and hardware investigation remain recorded in
+This describes the experimental `nvidia-intel-bridge-transfer-engine` branch and its
+`nvidia-intel-bridge-initialization` follow-up. The previous implementation and hardware investigation remain recorded in
 [nvidia-intel-multigpu-analysis.md](nvidia-intel-multigpu-analysis.md).
 
 ## Scope
@@ -79,16 +79,28 @@ submitted directly to KMS by this implementation.
 
 ## Initialization and policy
 
-The current phase retains asynchronous early instance preparation and lazy logical
-device initialization. `VkBridge::new()` now selects the exact requested DRM render
-node. The old one-shot preinit handoff and its ordering assumptions still need a
-separate investigation; spawning a thread before DRM acquisition does not prove
-that instance creation finished before acquisition. Recreating an engine can also
-require a fresh instance after the one-shot handoff was consumed.
+The initialization follow-up creates Smithay `Instance` / `PhysicalDevice` wrappers
+lazily on the existing background initialization thread. The physical device owns
+an Arc-backed instance reference; the transfer core owns that physical device until
+its logical device, batches and imports retire. Exact render-node matching and the
+Vulkan 1.2 capability gate remain in effect. There is no custom global receiver,
+one-shot bootstrap, vendor preference or early call from niri's main function.
+
+A real niri session with early preparation disabled created the raw Vulkan instance
+after DRM/display startup in 318 ms and had its logical device ready after 417 ms.
+Native-fence transfers activated successfully on NVIDIA 610.57.04. The wrapper-based
+version also passes offscreen engine/MultiRenderer probes, including reconstruction
+after invalidation; its real-session check is the next adoption gate.
+
+Keep initialization off the compositor event-loop thread. During the raw late-init
+experiment, an X11 connection caused niri to start xwayland-satellite while instance
+creation was in progress. This does not prove the historical hang's root cause, nor
+that synchronous main-thread initialization is safe. The test establishes that an
+early global hook was unnecessary for this observed late-background path/stack.
 
 `GpuManager::set_vulkan_transfer_enabled(false)` disables Vulkan transfers and
-retires their storage. The niri fork connects `NIRI_VKBRIDGE=0` to this policy as well
-as to preinitialization. No completion-redraw callback is needed for copied frames.
+retires their storage. The niri fork connects `NIRI_VKBRIDGE=0` to this policy.
+No completion-redraw callback is needed for copied frames.
 
 Allocation/import/unsupported-transfer failures fall back to the upstream CPU
 path. A failed pair is retried after invalidation/recreation, not on every frame.
@@ -132,7 +144,8 @@ control the running compositor. GPU/driver workloads still run; use bounded runs
 
 On NVIDIA 610.57.04 / Intel Mesa 26.2.2:
 
-- Eight pure transfer tests pass; the `renderer_multi`-without-Vulkan build passes.
+- Nine pure transfer tests pass after wrapper migration (eight at the phase-one
+  checkpoint); the `renderer_multi`-without-Vulkan build passes.
 - Niri workspace check and 216 niri/config/IPC library tests pass.
 - Engine ABGR8888 and ABGR2101010 pixel probes pass with negotiated modifiers.
 - A 1920x1080 / 1952x1104 ten-bit engine run passes 24 frames.

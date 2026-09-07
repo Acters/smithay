@@ -11,7 +11,6 @@
 
 use std::{
     collections::VecDeque,
-    ffi::CStr,
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
     sync::Arc,
 };
@@ -28,6 +27,7 @@ use crate::{
         },
         drm::DrmNode,
         renderer::sync::{Fence, Interrupted, SyncPoint},
+        vulkan::{AppInfo, Instance, InstanceError, PhysicalDevice, version::Version},
     },
     utils::{Buffer, Rectangle},
 };
@@ -62,64 +62,20 @@ impl VkBridgeError {
     }
 }
 
-// Only instance creation happens before DRM master acquisition. Device creation remains in
-// new(): moving it into preinit can interfere with direct scanout on proprietary NVIDIA.
-struct Preinit {
-    _entry: ash::Entry,
-    instance: ash::Instance,
-    preferred: Option<u32>,
-}
-
-impl Drop for Preinit {
-    fn drop(&mut self) {
-        unsafe { self.instance.destroy_instance(None) };
+impl From<InstanceError> for VkBridgeError {
+    fn from(err: InstanceError) -> Self {
+        match err {
+            // Preserve raw Vulkan errors, including the device-loss classification.
+            InstanceError::Vk(err) => Self::Vk(err),
+            err => Self::Setup(err.to_string()),
+        }
     }
-}
-
-type InitResult = Result<Preinit, VkBridgeError>;
-static PREINIT: std::sync::Mutex<Option<std::sync::mpsc::Receiver<InitResult>>> = std::sync::Mutex::new(None);
-
-/// Create the Vulkan instance before acquiring DRM master; defer logical device creation.
-/// `vendor_id` is a preference only: [`VkBridge::new`] always verifies the exact render node.
-pub fn preinit(vendor_id: Option<u32>) {
-    let mut slot = PREINIT.lock().unwrap();
-    if slot.is_some() {
-        return;
-    }
-    let (tx, rx) = std::sync::mpsc::channel();
-    match std::thread::Builder::new()
-        .name("vkbridge-init".into())
-        .spawn(move || {
-            let _ = tx.send(early_init(vendor_id));
-        }) {
-        Ok(_) => *slot = Some(rx),
-        Err(err) => warn!(%err, "could not spawn Vulkan preinit"),
-    }
-}
-
-fn early_init(preferred: Option<u32>) -> InitResult {
-    let started = std::time::Instant::now();
-    tracing::info!("Vulkan transfer instance initialization started");
-    let entry = unsafe { ash::Entry::load() }.map_err(|e| VkBridgeError::Setup(e.to_string()))?;
-    let app = vk::ApplicationInfo::default()
-        .application_name(c"smithay-vkbridge")
-        .api_version(vk::API_VERSION_1_2);
-    let instance =
-        unsafe { entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None) }?;
-    tracing::info!(
-        elapsed_ms = started.elapsed().as_millis(),
-        "Vulkan transfer instance created"
-    );
-    Ok(Preinit {
-        _entry: entry,
-        instance,
-        preferred,
-    })
 }
 
 struct Core {
-    init: Preinit,
-    phd: vk::PhysicalDevice,
+    // PhysicalDevice owns an Arc-backed Instance clone, keeping the loader/instance alive
+    // until this logical device and every batch/import using it have been destroyed.
+    phd: PhysicalDevice,
     device: ash::Device,
     queue: vk::Queue,
     family: u32,
@@ -130,25 +86,13 @@ struct Core {
 }
 
 impl Core {
-    fn modifier_properties(&self, format: vk::Format) -> Vec<vk::DrmFormatModifierPropertiesEXT> {
-        let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
-        let mut props = vk::FormatProperties2::default().push_next(&mut list);
-        unsafe {
-            self.init
-                .instance
-                .get_physical_device_format_properties2(self.phd, format, &mut props)
-        };
-        let mut modifiers =
-            vec![vk::DrmFormatModifierPropertiesEXT::default(); list.drm_format_modifier_count as usize];
-        list.p_drm_format_modifier_properties = modifiers.as_mut_ptr();
-        let mut props = vk::FormatProperties2::default().push_next(&mut list);
-        unsafe {
-            self.init
-                .instance
-                .get_physical_device_format_properties2(self.phd, format, &mut props)
-        };
-        modifiers.truncate(list.drm_format_modifier_count as usize);
-        modifiers
+    fn modifier_properties(
+        &self,
+        format: vk::Format,
+    ) -> Result<Vec<vk::DrmFormatModifierPropertiesEXT>, VkBridgeError> {
+        self.phd
+            .get_format_modifier_properties(format)
+            .map_err(|err| VkBridgeError::Setup(err.to_string()))
     }
 
     // Match the image created by import exactly: 2D, explicit modifier, exclusive sharing,
@@ -174,9 +118,10 @@ impl Core {
         let mut external_props = vk::ExternalImageFormatProperties::default();
         let mut image_props = vk::ImageFormatProperties2::default().push_next(&mut external_props);
         match unsafe {
-            self.init
-                .instance
-                .get_physical_device_image_format_properties2(self.phd, &info, &mut image_props)
+            self.phd
+                .instance()
+                .handle()
+                .get_physical_device_image_format_properties2(self.phd.handle(), &info, &mut image_props)
         } {
             Ok(()) => {}
             Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED) => return Ok(None),
@@ -348,26 +293,41 @@ impl std::fmt::Debug for VkBridge {
 }
 
 impl VkBridge {
-    /// Create the logical device on exactly `node`, consuming preinitialization if available.
+    /// Initialize an instance and logical device on exactly the supplied render `node`.
+    ///
+    /// MultiRenderer invokes this on its existing lazy background init thread, without a
+    /// global pre-DRM-master hook or vendor preference. Keep initialization off the compositor
+    /// event-loop thread: late background initialization has been observed to work, but this
+    /// does not establish that synchronous initialization on that thread is safe on all ICDs
+    /// or resolve the cause of historical initialization hangs.
+    /// The Smithay instance wrapper may enable debug utilities and, in debug builds, available
+    /// validation layers. Vulkan 1.2 remains required even if `SMITHAY_VK_VERSION` lowers the
+    /// wrapper's negotiated instance version.
     pub fn new(node: DrmNode) -> Result<Self, VkBridgeError> {
         let started = std::time::Instant::now();
-        let receiver = PREINIT.lock().unwrap().take();
+        tracing::info!(?node, "Vulkan transfer device initialization started");
+        let instance_started = std::time::Instant::now();
+        tracing::info!(?node, "Vulkan transfer instance initialization started");
+        let instance = Instance::new(
+            Version::VERSION_1_2,
+            Some(AppInfo {
+                name: "smithay-vkbridge".into(),
+                version: Version::VERSION_1_0,
+            }),
+        )?;
         tracing::info!(
             ?node,
-            preinitialized = receiver.is_some(),
-            "Vulkan transfer device initialization started"
+            elapsed_ms = instance_started.elapsed().as_millis(),
+            version = %instance.api_version(),
+            "Vulkan transfer instance created"
         );
-        let init = match receiver {
-            Some(rx) => rx
-                .recv()
-                .map_err(|_| VkBridgeError::Setup("preinit channel closed".into()))??,
-            None => early_init(None)?,
-        };
-        let mut devices = unsafe { init.instance.enumerate_physical_devices() }?;
-        devices.sort_by_key(|&phd| {
-            let props = unsafe { init.instance.get_physical_device_properties(phd) };
-            init.preferred.is_some_and(|v| v != props.vendor_id)
-        });
+        // Instance::new takes a MAX version and honors the loader/environment limit. Our
+        // extension dependency strategy relies on features promoted to Vulkan core 1.2.
+        if instance.api_version() < Version::VERSION_1_2 {
+            return Err(VkBridgeError::Setup(
+                "Vulkan transfer requires instance version 1.2".into(),
+            ));
+        }
         let required = [
             ext::physical_device_drm::NAME,
             ext::image_drm_format_modifier::NAME,
@@ -375,39 +335,24 @@ impl VkBridge {
             ext::queue_family_foreign::NAME,
             khr::external_memory_fd::NAME,
         ];
-        let mut selected = None;
-        for phd in devices {
-            let extensions = unsafe { init.instance.enumerate_device_extension_properties(phd) }?;
-            let supports = |name: &CStr| {
-                extensions
-                    .iter()
-                    .any(|p| unsafe { CStr::from_ptr(p.extension_name.as_ptr()) == name })
-            };
-            if !required.iter().all(|name| supports(name)) {
-                continue;
-            }
-            let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
-            let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
-            unsafe { init.instance.get_physical_device_properties2(phd, &mut props) };
-            if props.properties.api_version < vk::API_VERSION_1_2 {
-                continue;
-            }
-            if drm.has_render == vk::TRUE
-                && drm.render_major == node.major() as i64
-                && drm.render_minor == node.minor() as i64
-            {
-                selected = Some((phd, supports(khr::external_semaphore_fd::NAME)));
-                break;
-            }
-        }
-        let (phd, semaphore_extension) = selected.ok_or_else(|| {
-            VkBridgeError::Setup(
-                "no matching Vulkan 1.2 render node with explicit dma-buf/foreign ownership support".into(),
-            )
-        })?;
+        let phd = PhysicalDevice::enumerate(&instance)?
+            .find(|phd| {
+                phd.api_version() >= Version::VERSION_1_2
+                    && required.iter().all(|name| phd.has_device_extension(name))
+                    // No primary-node or vendor fallback: the bridge must use the render GPU.
+                    && phd.render_node().ok().flatten() == Some(node)
+            })
+            .ok_or_else(|| {
+                VkBridgeError::Setup(
+                    "no matching Vulkan 1.2 render node with explicit dma-buf/foreign ownership support"
+                        .into(),
+                )
+            })?;
+        let semaphore_extension = phd.has_device_extension(khr::external_semaphore_fd::NAME);
+        let instance = phd.instance().handle();
         // Graphics queues have unrestricted image-transfer granularity. Dedicated transfer
         // queues may require whole mip levels or aligned regions, incompatible with damage.
-        let families = unsafe { init.instance.get_physical_device_queue_family_properties(phd) };
+        let families = unsafe { instance.get_physical_device_queue_family_properties(phd.handle()) };
         let family = families
             .iter()
             .position(|p| p.queue_count > 0 && p.queue_flags.contains(vk::QueueFlags::GRAPHICS))
@@ -416,8 +361,8 @@ impl VkBridge {
         let mut semaphore_props = vk::ExternalSemaphoreProperties::default();
         if semaphore_extension {
             unsafe {
-                init.instance.get_physical_device_external_semaphore_properties(
-                    phd,
+                instance.get_physical_device_external_semaphore_properties(
+                    phd.handle(),
                     &vk::PhysicalDeviceExternalSemaphoreInfo::default()
                         .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
                     &mut semaphore_props,
@@ -433,8 +378,8 @@ impl VkBridge {
             names.push(khr::external_semaphore_fd::NAME.as_ptr());
         }
         let device = unsafe {
-            init.instance.create_device(
-                phd,
+            instance.create_device(
+                phd.handle(),
                 &vk::DeviceCreateInfo::default()
                     .queue_create_infos(&queues)
                     .enabled_extension_names(&names),
@@ -443,18 +388,18 @@ impl VkBridge {
         }?;
         // All operations after device creation are infallible until ownership reaches Core.
         let queue = unsafe { device.get_device_queue(family, 0) };
-        let memory_fd = khr::external_memory_fd::Device::new(&init.instance, &device);
+        let memory_fd = khr::external_memory_fd::Device::new(instance, &device);
         let semaphore_fd =
-            semaphore_extension.then(|| khr::external_semaphore_fd::Device::new(&init.instance, &device));
+            semaphore_extension.then(|| khr::external_semaphore_fd::Device::new(instance, &device));
         let features = semaphore_props.external_semaphore_features;
         tracing::info!(
             ?node,
+            device = phd.name(),
             elapsed_ms = started.elapsed().as_millis(),
             "Vulkan transfer device ready"
         );
         Ok(Self {
             core: Arc::new(Core {
-                init,
                 phd,
                 device,
                 queue,
@@ -504,7 +449,7 @@ impl VkBridge {
             return Ok(result);
         }
         let mut modifiers = Vec::new();
-        for candidate in self.core.modifier_properties(format) {
+        for candidate in self.core.modifier_properties(format)? {
             if !single_plane_transfer(&candidate, true) {
                 continue;
             }
@@ -693,7 +638,7 @@ impl VkBridge {
         };
         let modifier = u64::from(dmabuf.format().modifier);
         // Use the same exact modifier/usage/importability checks as allocation negotiation.
-        let modifiers = core.modifier_properties(format);
+        let modifiers = core.modifier_properties(format)?;
         if !modifiers
             .iter()
             .any(|m| m.drm_format_modifier == modifier && single_plane_transfer(m, source))
@@ -1051,6 +996,16 @@ mod tests {
         limits.sample_counts = vk::SampleCountFlags::TYPE_1;
         limits.max_array_layers = 0;
         assert!(!fits_image(&limits, 256, 160));
+    }
+
+    #[test]
+    fn wrapper_instance_errors_preserve_vulkan_classification() {
+        let lost = VkBridgeError::from(InstanceError::Vk(vk::Result::ERROR_DEVICE_LOST));
+        assert!(lost.is_device_lost());
+        assert!(matches!(
+            VkBridgeError::from(InstanceError::UnsupportedVersion),
+            VkBridgeError::Setup(_)
+        ));
     }
 
     #[test]
