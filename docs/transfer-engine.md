@@ -369,5 +369,12 @@ This is four-clear layout/bandwidth evidence, not GPU execution or desktop pacin
 Small/full-HD native MultiRenderer tests pass exact sparse damage, shared readers,
 capture/blits, three mixed targets and invalidation; strict counters prove both
 legs for every non-GLES measured draw. Existing single-copy routes remain tested.
-Live adoption/performance is a separate gate recorded by niri's
-`docs/intel-tiled-reverse-plan.md`.
+The live gate rejected detiling as a performance default: same-binary balanced
+DP-1 trials measured198.296/s single-copy,160.602/s with detiling, and200.710/s after
+restoring single-copy. Both legs actually ran and steady resource churn stayed zero;
+the clear-only proxy did not predict desktop pacing. Keep this path experimental
+and default-off. Later matched quiet single-copy trials measured239.007/s under
+performance versus187.625/s under balanced; the profile driver was intel_pstate,
+so this does not isolate NVIDIA GPU-clock behavior. The user restored the prior
+NVIDIA-primary pooled compositor after testing. Niri's
+`docs/intel-tiled-reverse-plan.md` records raw data, caveats and retained setup.
