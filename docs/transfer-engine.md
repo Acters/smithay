@@ -301,4 +301,16 @@ ready. This is not a claim that Vulkan permits semaphore signaling after a submi
 fence, nor a relaxed old-fence regression check. Native initial-lag diagnostics stay
 visible in the test result.
 
-Real compositor pacing measurements for pooling remain a separate adoption gate.
+The approved live comparison passed with niri `eca35507` / Smithay `e6912c04` on the
+same balanced-profile, direct-target/LINEAR setup. With btop hidden but running,
+KMS cadence improved from 140.464/s to 143.946/s; refresh gaps fell from 441 over
+125s to 5 over 105s. The closed-monitor pooled run measured 143.991/s with zero
+refresh gaps over 110s. Steady windows reused a set per copy without creating or
+destroying sets or replacing signal semaphores. Btop-on presentation retirement
+fell from 0.814 ms average / 19.817 ms maximum to 0.024 / 0.060 ms. The user confirmed
+stable ~144 FPS and chose to keep pooling enabled.
+
+These are sequential machine-specific measurements, not a promise of zero jitter,
+a GPU-execution-time measurement or proof of a particular driver lock. The niri
+checkout's `docs/vulkan-submission-pool.md` records the full settings, raw-data path,
+remaining caveats and rollback.
