@@ -41,20 +41,36 @@ single reusable target-owned LINEAR destination, not a modulo-only ring:
   Failed target-frame finish discards the destination rather than recycling an
   allocation without a known reader fence.
 
-A Vulkan batch owns its command pool, original VkFence, semaphore handles and
-imported images until retirement. Exported SYNC_FD payload lifetime is distinct
-from Vulkan semaphore-handle lifetime. DMA-BUFs are retained by stable allocation
-identity, not by integer FD number. Import and pending-batch caches are bounded;
-input SyncPoints are not retained as a recursively growing chain of old batches.
+A pending Vulkan submission owns its command pool/buffer, original VkFence,
+semaphore handles and imported images until actual retirement. On the
+`nvidia-intel-bridge-pooled` follow-up, the owner then freezes the submission's logical
+completion state and extracts its resource set into a bounded idle pool (maximum
+eight sets). Completed SyncPoints keep that immutable outcome and their independent
+exported FD, not mutable Vulkan handles. Reset and reuse occur only on owner-thread
+checkout; querying or waiting an old fence can never observe a newer use of a reset
+VkFence. Concurrent wait/status and resource extraction are protected by the same
+state mutex; reaping and pending status queries use nonblocking try-lock behavior.
+
+Exported SYNC_FD payload lifetime is distinct from Vulkan semaphore-handle lifetime.
+Reusable wait semaphores use temporary imports; an abandoned import or failed native
+signal export is repaired only after safe retirement. DMA-BUFs are retained by
+stable allocation identity, not integer FD number. Import/pending/idle caches are
+bounded; idle resource sets do not retain old imported images, and input SyncPoints
+are not retained as a recursively growing chain of old batches. Ordinary completed
+SyncPoint destruction no longer performs per-frame Vulkan resource destruction.
 
 Generic cache invalidation and device re-enumeration retire transfer storage.
 Source-manager generation identities are checked when acquiring a cross-manager
 renderer, even if re-enumeration/invalidation happened before that acquisition or
 Vulkan was disabled in the meantime.
 
-Known Vulkan device loss retires in-flight access but invalidates external memory
-contents. The transfer route reports a context-loss error and requires explicit
-invalidation/recreation; it does not fall back to partial reuse of those pixels.
+An actual per-fence status/wait returning device loss can establish retirement for
+that fence, but a global loss flag is not proof that other pending submissions have
+retired. Potentially submitted work (including queue-submit device loss) retains its
+ownership until an actual retirement wait or conservative ownership retention on an
+unexpected failure. Lost-device resources are not recycled. Device loss invalidates
+external memory contents, reports a context-loss error, and requires explicit
+invalidation/recreation rather than partial reuse of those pixels.
 
 ## Modifier negotiation
 
@@ -260,3 +276,29 @@ remains available for unsupported cases.
 This establishes the tested live path on this machine, not a universal driver
 compatibility or performance claim. No per-output renderer migration, dynamic GPU
 selection, long-term soak result, or measured power/latency benefit is implied.
+
+### Pooled-resource validation
+
+Run the retained-fence stress without KMS access:
+
+```sh
+SMITHAY_FRAME_TIMING=1 target/debug/examples/vulkan_transfer \
+  --pool-stress --frames 128 --source /dev/dri/renderD129 \
+  --target /dev/dri/renderD128 --format abgr2101010
+```
+
+In both 8-bit and 10-bit runs, 256 submissions used one resource set, reused 255
+times, with zero steady resource destruction, pool-busy results or signal-semaphore
+replacement. All 256 retained old fences stayed valid across reuse, resize, a
+concurrent waiter and engine destruction. Full-resolution direct-target pixel,
+shared-context, capture and blit regression tests also pass.
+
+The stress records first native-FD readiness separately: a zero-time first poll can
+lag the CPU VkFence observation on this tested driver, also reproduced with the
+unpooled reference. A bounded first-publication deadline is enforced without blocking
+producer reuse; once POLLIN is observed, every later zero-time poll must remain
+ready. This is not a claim that Vulkan permits semaphore signaling after a submit
+fence, nor a relaxed old-fence regression check. Native initial-lag diagnostics stay
+visible in the test result.
+
+Real compositor pacing measurements for pooling remain a separate adoption gate.

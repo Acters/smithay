@@ -25,15 +25,20 @@
 //! >3-region damage), same-target GLES capture, fallback-to-direct transitions and MultiFrame
 //! blit flushes. Proof of the no-intermediate-blit route additionally requires the log message
 //! `submitted direct Vulkan framebuffer transfer`. This mode never activates scanout.
+//! Add `--pool-stress --frames 64` in direct-engine mode with `SMITHAY_FRAME_TIMING=1`
+//! to check bounded resource reuse and retained old fences across both sizes and engine
+//! destruction, with one concurrent fence-wait worker. This does not assert CPU submit latency.
 
 use std::{
     error::Error,
     fs::{File, OpenOptions},
     os::{
-        fd::OwnedFd,
+        fd::{AsRawFd, OwnedFd},
         unix::fs::{FileTypeExt, OpenOptionsExt},
     },
     path::{Path, PathBuf},
+    sync::mpsc::{SyncSender, TrySendError, sync_channel},
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -51,7 +56,12 @@ use smithay::{
             Bind, BlitFrame, Color32F, ExportMem, Frame, ImportDma, Offscreen, Renderer, TextureFilter,
             TextureMapping,
             gles::{GlesRenderbuffer, GlesRenderer, GlesTexture},
-            multigpu::{ApiDevice, GpuManager, gbm::GbmGlesBackend, vkbridge::VkBridge},
+            multigpu::{
+                ApiDevice, GpuManager,
+                gbm::GbmGlesBackend,
+                timing::{self, Counter},
+                vkbridge::VkBridge,
+            },
             sync::SyncPoint,
         },
     },
@@ -109,6 +119,9 @@ struct Args {
     /// Write three original target LINEAR dma-bufs via MultiRenderer; inspect direct-route logs.
     #[arg(long, requires = "multigpu", conflicts_with = "scanout_candidate")]
     direct_target: bool,
+    /// Stress pooled fences/reuse; requires --frames >=64 and SMITHAY_FRAME_TIMING=1.
+    #[arg(long, conflicts_with_all = ["multigpu", "direct_target"])]
+    pool_stress: bool,
 }
 
 fn parse_modifier(value: &str) -> Result<u64, std::num::ParseIntError> {
@@ -296,6 +309,312 @@ where
     Ok(bytes.to_vec())
 }
 
+// Declared after the original allocations: even an oracle/submit error must retire
+// published producer, Vulkan and target-reader work before those allocations drop.
+#[derive(Default)]
+struct RetireFences {
+    producer: SyncPoint,
+    copy: SyncPoint,
+    reader: SyncPoint,
+}
+
+impl Drop for RetireFences {
+    fn drop(&mut self) {
+        for fence in [&self.producer, &self.copy, &self.reader] {
+            while fence.wait().is_err() {
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+fn check_logical_fence(fence: &SyncPoint) -> ProbeResult<()> {
+    // Check BEFORE wait: never silently wait for a reset/reused newer submission.
+    if !fence.is_reached() {
+        return Err("completed pooled fence regressed to unsignaled".into());
+    }
+    fence.wait()?;
+    if !fence.is_reached() {
+        return Err("completed pooled fence regressed after wait".into());
+    }
+    Ok(())
+}
+
+// Separate first native publication from regression of a previously observed signal.
+// This diagnostic allowance does NOT establish that driver publication lag is legal.
+const INITIAL_NATIVE_DEADLINE: Duration = Duration::from_millis(500);
+
+#[derive(Default)]
+struct NativeStats {
+    checks: u64,
+    initial_misses: u64,
+    max_observed_latency: Duration,
+}
+
+struct OldFence {
+    logical: SyncPoint,
+    // Exactly one export per record: never replace an fd after a miss or timeout.
+    native: Option<OwnedFd>,
+    ever_native_signaled: bool,
+    initial_miss: bool,
+    logical_completed_at: Instant,
+}
+
+impl OldFence {
+    fn new(fence: &SyncPoint) -> ProbeResult<Self> {
+        check_logical_fence(fence)?;
+        let logical_completed_at = Instant::now();
+        let native = fence.export();
+        if native.is_none() && fence.is_exportable() {
+            return Err("exportable old fence failed native export".into());
+        }
+        Ok(Self {
+            logical: fence.clone(),
+            native,
+            ever_native_signaled: false,
+            initial_miss: false,
+            logical_completed_at,
+        })
+    }
+
+    fn check(&mut self, stats: &mut NativeStats, settle_initial: bool) -> ProbeResult<()> {
+        check_logical_fence(&self.logical)?;
+        let Some(fd) = self.native.as_ref() else {
+            return Ok(());
+        };
+        let deadline = self.logical_completed_at + INITIAL_NATIVE_DEADLINE;
+        let mut timeout = 0;
+        loop {
+            let mut pollfd = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: the single pollfd and its owned descriptor remain live for poll.
+            let result = unsafe { libc::poll(&mut pollfd, 1, timeout) };
+            if result < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(err.into());
+                }
+                if Instant::now() >= deadline && !self.ever_native_signaled {
+                    return Err("initial native publication deadline expired during EINTR".into());
+                }
+                // Recompute remaining time below, never restart the deadline.
+            } else {
+                stats.checks += 1;
+                if pollfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0
+                    || (result > 0 && pollfd.revents & libc::POLLIN == 0)
+                {
+                    return Err(format!(
+                        "native fence poll error: result={result} events={}",
+                        pollfd.revents
+                    )
+                    .into());
+                }
+                if result == 1 && pollfd.revents & libc::POLLIN != 0 {
+                    if !self.ever_native_signaled {
+                        let latency = self.logical_completed_at.elapsed();
+                        if latency >= INITIAL_NATIVE_DEADLINE {
+                            return Err(format!(
+                                "initial native publication observed after deadline: {latency:?}"
+                            )
+                            .into());
+                        }
+                        stats.max_observed_latency = stats.max_observed_latency.max(latency);
+                        self.ever_native_signaled = true;
+                    }
+                    return Ok(());
+                }
+                if self.ever_native_signaled {
+                    return Err("previously signaled old native fence regressed to not ready".into());
+                }
+                if !self.initial_miss {
+                    self.initial_miss = true;
+                    stats.initial_misses += 1;
+                }
+                if Instant::now() >= deadline {
+                    return Err("initial native publication timed out (500ms, same fd)".into());
+                }
+                if !settle_initial {
+                    return Ok(());
+                }
+            }
+            timeout = if settle_initial && !self.ever_native_signaled {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                remaining.as_millis().saturating_add(1).min(500) as i32
+            } else {
+                0
+            };
+        }
+    }
+}
+
+#[derive(Default)]
+struct WorkerReport {
+    completed: u64,
+    native: NativeStats,
+}
+
+struct PoolStress {
+    old: Vec<OldFence>,
+    sender: Option<SyncSender<SyncPoint>>,
+    worker: Option<JoinHandle<Result<WorkerReport, String>>>,
+    // Created, reused, recycled, destroyed, busy, dirty signal replacements.
+    // Logical batches are NOT allocations.
+    counts: [u64; 6],
+    submitted: u64,
+    worker_queued: u64,
+    native: NativeStats,
+    worker_native: NativeStats,
+}
+
+impl PoolStress {
+    fn new() -> ProbeResult<Self> {
+        let (sender, receiver) = sync_channel::<SyncPoint>(2);
+        let worker = std::thread::Builder::new()
+            .name("pool-fence-wait".into())
+            .spawn(move || {
+                let mut report = WorkerReport::default();
+                for fence in receiver {
+                    while fence.wait().is_err() {
+                        std::thread::yield_now();
+                    }
+                    let mut old = OldFence::new(&fence).map_err(|err| err.to_string())?;
+                    // Only this worker may block for initial native publication while
+                    // production continues. Keep and poll the SAME export throughout.
+                    old.check(&mut report.native, true)
+                        .map_err(|err| err.to_string())?;
+                    old.check(&mut report.native, false)
+                        .map_err(|err| err.to_string())?;
+                    report.completed += 1;
+                }
+                Ok(report)
+            })?;
+        Ok(Self {
+            old: Vec::new(),
+            sender: Some(sender),
+            worker: Some(worker),
+            counts: [0; 6],
+            submitted: 0,
+            worker_queued: 0,
+            native: NativeStats::default(),
+            worker_native: NativeStats::default(),
+        })
+    }
+
+    fn check_old(&mut self) -> ProbeResult<()> {
+        for fence in &mut self.old {
+            fence.check(&mut self.native, false)?;
+        }
+        Ok(())
+    }
+
+    fn submitted(&mut self, fence: &SyncPoint) -> ProbeResult<()> {
+        self.submitted += 1;
+        // Never wait for the worker/queue on the rendering thread. A busy worker samples
+        // fewer submissions; every completion still enters the main-thread old-fence oracle.
+        match self.sender.as_ref().unwrap().try_send(fence.clone()) {
+            Ok(()) => self.worker_queued += 1,
+            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {
+                self.sender.take();
+                let reason = match self.worker.take().unwrap().join() {
+                    Ok(Err(error)) => error,
+                    Ok(Ok(report)) => format!("worker exited early after {} waits", report.completed),
+                    Err(_) => "worker panicked".to_owned(),
+                };
+                return Err(format!("fence worker disconnected: {reason}").into());
+            }
+        }
+        self.check_old()
+    }
+
+    fn completed(&mut self, fence: &SyncPoint) -> ProbeResult<()> {
+        let mut old = OldFence::new(fence)?;
+        old.check(&mut self.native, false)?;
+        self.old.push(old);
+        Ok(())
+    }
+
+    fn snapshot(&mut self) -> [u64; 6] {
+        let counters = [
+            Counter::ResourceSetsCreated,
+            Counter::ResourceSetsReused,
+            Counter::ResourceSetsRecycled,
+            Counter::ResourceSetsDestroyed,
+            Counter::ResourcePoolBusy,
+            Counter::SignalSemaphoresReplaced,
+        ];
+        let mut delta = [0; 6];
+        for snapshot in timing::drain() {
+            for (counter, value) in snapshot.counters {
+                if let Some(index) = counters.iter().position(|&c| c == counter) {
+                    delta[index] += value;
+                }
+            }
+        }
+        for (total, value) in self.counts.iter_mut().zip(delta) {
+            *total += value;
+        }
+        delta
+    }
+
+    fn settle(&mut self) -> ProbeResult<u64> {
+        self.sender.take();
+        match self.worker.take().unwrap().join() {
+            Ok(Ok(report)) => {
+                self.worker_native = report.native;
+                Ok(report.completed)
+            }
+            Ok(Err(err)) => Err(err.into()),
+            Err(_) => Err("fence worker panicked".into()),
+        }
+    }
+
+    fn prove_before_drop(&mut self) -> ProbeResult<u64> {
+        // Production has stopped: settle any remaining initial publications against
+        // their ORIGINAL deadlines before joining and before destroying the engine.
+        for fence in &mut self.old {
+            fence.check(&mut self.native, true)?;
+        }
+        let waited = self.settle()?;
+        self.check_old()?;
+        self.snapshot();
+        let [created, reused, _, destroyed, busy, signals_replaced] = self.counts;
+        if created == 0
+            || created > 8
+            || reused < self.submitted.saturating_sub(8)
+            || destroyed != 0
+            || busy != 0
+            || signals_replaced != 0
+            || waited == 0
+            || waited != self.worker_queued
+            || self.old.len() as u64 != self.submitted
+        {
+            return Err(format!(
+                "pool proof failed: counts={:?} submitted={} old={} worker={waited}/{}",
+                self.counts,
+                self.submitted,
+                self.old.len(),
+                self.worker_queued
+            )
+            .into());
+        }
+        Ok(waited)
+    }
+}
+
+impl Drop for PoolStress {
+    fn drop(&mut self) {
+        // On every error path close the bounded channel and settle the only worker.
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 fn run_size(
     bridge: &mut VkBridge,
     source: &mut Gpu,
@@ -303,6 +622,7 @@ fn run_size(
     args: &Args,
     w: i32,
     h: i32,
+    mut stress: Option<&mut PoolStress>,
 ) -> ProbeResult<()> {
     let format = Fourcc::from(args.format);
     let mut modifiers: Vec<_> = source
@@ -387,7 +707,11 @@ fn run_size(
     let mut previous_colors = colors;
     let mut source_release = SyncPoint::signaled();
     let mut target_release: Option<SyncPoint> = None;
+    let mut retire = RetireFences::default();
     for sequence in 0..args.frames {
+        if let Some(stress) = stress.as_deref_mut() {
+            stress.check_old()?;
+        }
         // Server wait when native export is available; explicit CPU wait otherwise.
         source.renderer.wait(&source_release)?;
         let update = if sequence == 0 {
@@ -399,9 +723,14 @@ fn run_size(
             colors[index] = (colors[index] + 1 + sequence as usize % 7) % COLORS.len();
         }
         let acquire = render_source(&mut source.renderer, &mut src, &rects, &colors, update)?;
+        retire.producer = acquire.clone();
         let damage = update.map(|index| rects[index]).unwrap_or(full);
         let started = Instant::now();
         let copy = bridge.copy(&src, &dst, &acquire, target_release.as_ref(), &[damage])?;
+        retire.copy = copy.clone();
+        if let Some(stress) = stress.as_deref_mut() {
+            stress.submitted(&copy)?;
+        }
         println!(
             "SUBMIT frame={sequence} damage={damage:?} elapsed_us={} producer_native={} copy_native={} complete_at_return={}",
             started.elapsed().as_micros(),
@@ -421,6 +750,12 @@ fn run_size(
                 release,
                 sequence - 1,
             )?;
+            if let Some(stress) = stress.as_deref_mut() {
+                // Target readback proves the preceding Vulkan copy completed. Do not
+                // add a CPU wait before the NEXT submission to manufacture completion.
+                stress.completed(&source_release)?;
+                stress.check_old()?;
+            }
         }
         source_release = copy.clone();
         target.renderer.wait(&copy)?;
@@ -444,7 +779,16 @@ fn run_size(
             1.,
         )?;
         target_release = Some(frame.finish()?);
+        retire.reader = target_release.as_ref().unwrap().clone();
         previous_colors = colors;
+        if let Some(stress) = stress.as_deref_mut() {
+            let delta = stress.snapshot();
+            // Allow a generous 16-submission warmup at each size, but no steady-state
+            // resource-set churn. Resize imports/staging are not resource-set counters.
+            if sequence >= 16 && (delta[0] != 0 || delta[3] != 0 || delta[5] != 0) {
+                return Err(format!("pool resource churn after warmup: {delta:?}").into());
+            }
+        }
     }
     verify(
         &mut target.renderer,
@@ -456,6 +800,10 @@ fn run_size(
         args.frames - 1,
     )?;
     source_release.wait()?;
+    if let Some(stress) = stress {
+        stress.completed(&source_release)?;
+        stress.check_old()?;
+    }
     // Both allocations are recreated on the next run_size call; the same engine keeps its
     // bounded stable-identity cache. Original GBM BOs remain alive for this entire round.
     Ok(())
@@ -1270,6 +1618,9 @@ mod direct_tests {
 
 fn main() -> ProbeResult<()> {
     let args = Args::parse();
+    if args.pool_stress && (args.frames < 64 || !timing::enabled()) {
+        return Err("--pool-stress requires --frames >=64 and SMITHAY_FRAME_TIMING=1".into());
+    }
     if !cfg!(target_endian = "little") {
         return Err("RGBA byte oracle requires little endian".into());
     }
@@ -1291,13 +1642,68 @@ fn main() -> ProbeResult<()> {
         args.source.display(),
         args.target.display()
     );
+    // One explicitly labelled pair on this recording thread; the worker intentionally
+    // does not enter it (wait timing must not be confused with driver allocations).
+    let _timing_scope = if args.pool_stress {
+        let stream = (1, 1);
+        timing::register_stream(
+            stream,
+            &format!(
+                "pool-stress {} -> {}",
+                args.source.display(),
+                args.target.display()
+            ),
+        );
+        timing::enter(stream)
+    } else {
+        None
+    };
+    let mut stress = if args.pool_stress {
+        Some(PoolStress::new()?)
+    } else {
+        None
+    };
     let mut bridge = VkBridge::new(source_node)?;
     println!("INIT source GBM/EGL");
     let mut source = Gpu::new(source_file)?;
     println!("INIT target GBM/EGL");
     let mut target = Gpu::new(target_file)?;
     for (w, h) in [(args.width, args.height), (args.width + 32, args.height + 24)] {
-        run_size(&mut bridge, &mut source, &mut target, &args, w as i32, h as i32)?;
+        run_size(
+            &mut bridge,
+            &mut source,
+            &mut target,
+            &args,
+            w as i32,
+            h as i32,
+            stress.as_mut(),
+        )?;
+    }
+    if let Some(stress) = stress.as_mut() {
+        // Teardown legitimately destroys the bounded cache: snapshot/assert BEFORE drop.
+        let waited = stress.prove_before_drop()?;
+        drop(bridge);
+        stress.check_old()?;
+        let [created, reused, recycled, destroyed, busy, signals_replaced] = stress.counts;
+        println!(
+            "PASS POOL-STRESS frames={} old_fences={} worker_waits={waited} created={created} reused={reused} recycled={recycled} destroyed_before_drop={destroyed} busy={busy} signals_replaced={signals_replaced} native_checks={} (old fences valid after engine drop)",
+            stress.submitted,
+            stress.old.len(),
+            stress.native.checks + stress.worker_native.checks
+        );
+        println!(
+            "NATIVE PUBLICATION initialNativeMisses={} main_initial_misses={} worker_initial_misses={} max_observed_latency_us={} main_max_observed_latency_us={} worker_max_observed_latency_us={} deadline_ms=500 (first-publication diagnostic; previously ready fds must stay immediately ready)",
+            stress.native.initial_misses + stress.worker_native.initial_misses,
+            stress.native.initial_misses,
+            stress.worker_native.initial_misses,
+            stress
+                .native
+                .max_observed_latency
+                .max(stress.worker_native.max_observed_latency)
+                .as_micros(),
+            stress.native.max_observed_latency.as_micros(),
+            stress.worker_native.max_observed_latency.as_micros(),
+        );
     }
     if args.scanout_candidate {
         println!(

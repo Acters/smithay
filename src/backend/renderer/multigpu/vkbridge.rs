@@ -12,7 +12,10 @@
 use std::{
     collections::VecDeque,
     os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use super::timing::{self, Counter, Stage};
@@ -34,6 +37,8 @@ use crate::{
 };
 
 /// Failure to initialize or submit a transfer. No successful submission is hidden by an error.
+/// Device loss can leave work submitted and invalidates allocation contents: it is never
+/// evidence that buffers may be reused. Potentially submitted ownership is retired or retained.
 #[derive(Debug, thiserror::Error)]
 pub enum VkBridgeError {
     /// Loader, capability or device selection failure.
@@ -84,6 +89,8 @@ struct Core {
     semaphore_fd: Option<khr::external_semaphore_fd::Device>,
     import_sync_fd: bool,
     export_sync_fd: bool,
+    // Consumers can discover loss while the owner skips their locked completion.
+    device_lost: AtomicBool,
 }
 
 impl Core {
@@ -168,64 +175,253 @@ impl Drop for Imported {
     }
 }
 
-// One pool per batch avoids externally synchronized command-pool operations between the
-// compositor and a SyncPoint dropped on another thread. There is no Core -> Batch reference.
+// Pool operations belong exclusively to the engine's mutable owner. SyncPoints never
+// own reusable handles directly: a completion mutex fences every query/wait against
+// extraction, and extraction freezes the logical outcome before a handle can be reset.
 struct Resources {
     core: Arc<Core>,
-    _images: [Arc<Imported>; 2],
     pool: vk::CommandPool,
+    command: vk::CommandBuffer,
     fence: vk::Fence,
-    semaphores: Vec<vk::Semaphore>,
+    waits: [vk::Semaphore; 2],
+    signal: vk::Semaphore,
+    // Temporary imports not consumed by a submission must be replaced on checkout.
+    dirty_waits: [bool; 2],
+    // A submitted signal is clean only after successful SYNC_FD copy export.
+    dirty_signal: bool,
+}
+
+impl Resources {
+    fn new(core: Arc<Core>) -> Result<Self, vk::Result> {
+        // Partial construction is RAII-safe; null Vulkan destruction is permitted.
+        let mut r = Self {
+            core,
+            pool: vk::CommandPool::null(),
+            command: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            waits: [vk::Semaphore::null(); 2],
+            signal: vk::Semaphore::null(),
+            dirty_waits: [false; 2],
+            dirty_signal: false,
+        };
+        timing::count(Counter::ResourceSetsCreated, 1);
+        unsafe {
+            let device = &r.core.device;
+            r.pool = device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default().queue_family_index(r.core.family),
+                None,
+            )?;
+            r.command = device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(r.pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )?[0];
+            r.fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
+            for sem in &mut r.waits {
+                *sem = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
+            }
+        }
+        r.signal = r.create_signal()?;
+        Ok(r)
+    }
+
+    fn create_signal(&self) -> Result<vk::Semaphore, vk::Result> {
+        if !self.core.export_sync_fd {
+            return Ok(vk::Semaphore::null());
+        }
+        let mut export = vk::ExportSemaphoreCreateInfo::default()
+            .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        unsafe {
+            self.core
+                .device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut export), None)
+        }
+    }
+
+    fn reset(&mut self) -> Result<(), vk::Result> {
+        let _timing = timing::time(Stage::VulkanPoolReset);
+        // Only extracted, GPU-retired or never-submitted sets reach here. No consumer
+        // can still query this original fence. Keep command-pool backing allocations.
+        unsafe {
+            self.core
+                .device
+                .reset_command_pool(self.pool, vk::CommandPoolResetFlags::empty())?;
+            self.core.device.reset_fences(&[self.fence])?;
+            for index in 0..self.waits.len() {
+                if self.dirty_waits[index] {
+                    let replacement = self
+                        .core
+                        .device
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
+                    self.core.device.destroy_semaphore(self.waits[index], None);
+                    self.waits[index] = replacement;
+                    self.dirty_waits[index] = false;
+                }
+            }
+            if self.dirty_signal {
+                // Rare failed export: retirement alone does not unsignal a binary semaphore.
+                let replacement = self.create_signal()?;
+                self.core.device.destroy_semaphore(self.signal, None);
+                self.signal = replacement;
+                self.dirty_signal = false;
+                timing::count(Counter::SignalSemaphoresReplaced, 1);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Resources {
     fn drop(&mut self) {
         let _timing = timing::time(Stage::ResourcesDestroy);
+        timing::count(Counter::ResourceSetsDestroyed, 1);
         unsafe {
-            for sem in self.semaphores.drain(..) {
+            for sem in self.waits {
                 self.core.device.destroy_semaphore(sem, None);
             }
+            self.core.device.destroy_semaphore(self.signal, None);
             self.core.device.destroy_fence(self.fence, None);
             self.core.device.destroy_command_pool(self.pool, None);
         }
     }
 }
 
-struct Batch {
-    resources: Option<Resources>,
-    submitted: bool,
+// Returning a pre-submit error never loses a slot. Unconsumed temporary payloads and
+// partially recorded command buffers are repaired at the next checkout, without GPU waits.
+struct Checkout<'a, T> {
+    idle: &'a mut Vec<T>,
+    resources: Option<T>,
 }
 
-impl Batch {
-    fn resources(&self) -> &Resources {
-        self.resources.as_ref().unwrap()
-    }
-
-    fn complete(&self) -> Result<bool, vk::Result> {
-        let r = self.resources();
-        unsafe { r.core.device.get_fence_status(r.fence) }
-    }
-
-    fn wait(&self) -> Result<(), vk::Result> {
-        let _timing = timing::time(Stage::VulkanFenceWait);
-        let r = self.resources();
-        unsafe { r.core.device.wait_for_fences(&[r.fence], true, u64::MAX) }
+impl<T> Drop for Checkout<'_, T> {
+    fn drop(&mut self) {
+        if let Some(resources) = self.resources.take() {
+            self.idle.push(resources);
+        }
     }
 }
 
-impl Drop for Batch {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    Pending,
+    Complete,
+    DeviceLost,
+}
+
+// Generic ownership transition is also exercised without a Vulkan device in tests.
+struct CompletionState<T> {
+    outcome: Outcome,
+    owned: Option<T>,
+}
+
+impl<T> CompletionState<T> {
+    fn pending(owned: T) -> Self {
+        Self {
+            outcome: Outcome::Pending,
+            owned: Some(owned),
+        }
+    }
+
+    fn observe(&mut self, result: Result<bool, vk::Result>) -> Result<bool, vk::Result> {
+        match self.outcome {
+            Outcome::Complete => return Ok(true),
+            Outcome::DeviceLost => return Err(vk::Result::ERROR_DEVICE_LOST),
+            Outcome::Pending => {}
+        }
+        match result {
+            Ok(true) => self.outcome = Outcome::Complete,
+            Err(vk::Result::ERROR_DEVICE_LOST) => self.outcome = Outcome::DeviceLost,
+            _ => {}
+        }
+        result
+    }
+
+    fn take_retired(&mut self) -> Option<T> {
+        if self.outcome == Outcome::Pending {
+            None
+        } else {
+            self.owned.take()
+        }
+    }
+}
+
+struct Submission {
+    resources: Resources,
+    // No inputs/SyncPoints are retained: their imported fd payloads own dependencies.
+    _images: [Arc<Imported>; 2],
+}
+
+type State = CompletionState<Submission>;
+
+impl State {
+    fn poll(&mut self, wait: bool, retired: &AtomicBool) -> Result<bool, vk::Result> {
+        if self.outcome != Outcome::Pending {
+            retired.store(true, Ordering::Release);
+            return self.observe(Ok(false));
+        }
+        let r = &self.owned.as_ref().unwrap().resources;
+        // Global loss only stops new work. Each pending fence still needs its own
+        // driver result to prove retired access; another command's loss is not proof.
+        let result = if wait {
+            let _timing = timing::time(Stage::VulkanFenceWait);
+            unsafe { r.core.device.wait_for_fences(&[r.fence], true, u64::MAX) }.map(|()| true)
+        } else {
+            unsafe { r.core.device.get_fence_status(r.fence) }
+        };
+        if result == Err(vk::Result::ERROR_DEVICE_LOST) {
+            r.core.device_lost.store(true, Ordering::Relaxed);
+        }
+        let result = self.observe(result);
+        if self.outcome != Outcome::Pending {
+            // Publish while holding the state lock, before extraction/reset is possible.
+            // This cache is monotonic and treats loss as retired access, not valid pixels.
+            retired.store(true, Ordering::Release);
+        }
+        result
+    }
+}
+
+struct Completion {
+    state: Mutex<State>,
+    retired: AtomicBool,
+}
+
+impl Completion {
+    fn is_signaled(&self) -> bool {
+        if self.retired.load(Ordering::Acquire) {
+            return true;
+        }
+        let result = match self.state.try_lock() {
+            Ok(mut state) => state.poll(false, &self.retired),
+            Err(std::sync::TryLockError::Poisoned(err)) => err.into_inner().poll(false, &self.retired),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // A waiter may have published completion since the first load. Never
+                // report false merely because a terminal state's mutex is contended.
+                return self.retired.load(Ordering::Acquire);
+            }
+        };
+        matches!(result, Ok(true) | Err(vk::Result::ERROR_DEVICE_LOST))
+    }
+}
+
+impl Drop for Completion {
     fn drop(&mut self) {
         let _timing = timing::time(Stage::BatchDestroy);
-        if self.submitted {
-            match self.wait() {
-                Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => {
+        // Normally the engine has already extracted ownership. This also protects
+        // unwinding: an unexpected retirement failure retains the entire Core/image tree.
+        let state = self.state.get_mut().unwrap_or_else(|err| err.into_inner());
+        if state.owned.is_some() {
+            match state.poll(true, &self.retired) {
+                Ok(true) | Err(vk::Result::ERROR_DEVICE_LOST) => {
                     timing::count(Counter::BatchesRetired, 1);
                 }
-                Err(err) => {
-                    // An unexpected host-side wait failure is NOT completion. Leak the whole
-                    // ownership tree rather than free resources the GPU might still access.
-                    warn!(?err, "Vulkan retirement wait failed; retaining batch for safety");
-                    std::mem::forget(self.resources.take());
+                result => {
+                    warn!(
+                        ?result,
+                        "Vulkan retirement wait failed; retaining submission for safety"
+                    );
+                    std::mem::forget(state.owned.take());
                 }
             }
         }
@@ -233,7 +429,7 @@ impl Drop for Batch {
 }
 
 struct TransferFence {
-    batch: Arc<Batch>,
+    completion: Arc<Completion>,
     fd: Option<OwnedFd>,
 }
 
@@ -247,13 +443,20 @@ impl std::fmt::Debug for TransferFence {
 
 impl Fence for TransferFence {
     fn is_signaled(&self) -> bool {
-        matches!(
-            self.batch.complete(),
-            Ok(true) | Err(vk::Result::ERROR_DEVICE_LOST)
-        )
+        self.completion.is_signaled()
     }
     fn wait(&self) -> Result<(), Interrupted> {
-        retirement_wait(self.batch.wait())
+        if self.completion.retired.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        retirement_wait(
+            self.completion
+                .state
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .poll(true, &self.completion.retired)
+                .map(|_| ()),
+        )
     }
     fn is_exportable(&self) -> bool {
         self.fd.is_some()
@@ -276,6 +479,10 @@ const MAX_IMPORTS: usize = 8;
 const MAX_PENDING: usize = 8;
 const MAX_MODIFIER_QUERIES: usize = 8;
 
+fn pool_busy(pending: usize) -> bool {
+    pending >= MAX_PENDING
+}
+
 struct SourceModifiers {
     fourcc: Fourcc,
     width: u32,
@@ -284,12 +491,45 @@ struct SourceModifiers {
 }
 
 /// Transfer-only engine; allocations and presentation state belong to the caller.
-/// Dropping the engine or its last outstanding fence may wait for GPU retirement.
+/// Dropping the engine may wait for GPU retirement. Old fences keep their logical
+/// completion after retirement and never own recycled Vulkan handles.
 pub struct VkBridge {
     core: Arc<Core>,
     imports: VecDeque<Arc<Imported>>,
-    pending: Vec<Arc<Batch>>,
+    pending: Vec<Arc<Completion>>,
+    // idle + pending <= MAX_PENDING. Idle slots contain no images or old completions.
+    idle: Vec<Resources>,
     source_modifiers: VecDeque<SourceModifiers>,
+}
+
+impl Drop for VkBridge {
+    fn drop(&mut self) {
+        for completion in self.pending.drain(..) {
+            let mut state = completion.state.lock().unwrap_or_else(|err| err.into_inner());
+            match state.poll(true, &completion.retired) {
+                Ok(true) | Err(vk::Result::ERROR_DEVICE_LOST) => {
+                    let retired = state.take_retired();
+                    drop(state);
+                    if retired.is_some() {
+                        timing::count(Counter::BatchesRetired, 1);
+                    }
+                    // Teardown is on the engine owner. Old SyncPoints retain only immutable
+                    // logical outcome + their independent fd, never Vulkan handles/images.
+                    drop(retired);
+                }
+                result => {
+                    warn!(
+                        ?result,
+                        "Vulkan engine retirement failed; retaining completion for safety"
+                    );
+                    drop(state);
+                    // Preserve callable old fences AND the entire ownership tree. Do not
+                    // leave a Pending state without its resources, or free live GPU work.
+                    std::mem::forget(completion);
+                }
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for VkBridge {
@@ -416,9 +656,11 @@ impl VkBridge {
                 semaphore_fd,
                 import_sync_fd: features.contains(vk::ExternalSemaphoreFeatureFlags::IMPORTABLE),
                 export_sync_fd: features.contains(vk::ExternalSemaphoreFeatureFlags::EXPORTABLE),
+                device_lost: AtomicBool::new(false),
             }),
             imports: VecDeque::new(),
-            pending: Vec::new(),
+            pending: Vec::with_capacity(MAX_PENDING),
+            idle: Vec::with_capacity(MAX_PENDING),
             source_modifiers: VecDeque::new(),
         })
     }
@@ -501,76 +743,123 @@ impl VkBridge {
         regions: &[Rectangle<i32, Buffer>],
     ) -> Result<SyncPoint, VkBridgeError> {
         let _copy_timing = timing::time(Stage::VulkanCopy);
+        if self.core.device_lost.load(Ordering::Relaxed) {
+            return Err(vk::Result::ERROR_DEVICE_LOST.into());
+        }
+        let result = self.copy_inner(src, dst, acquire, destination_release, regions);
+        if result.as_ref().is_err_and(|err| err.is_device_lost()) {
+            self.core.device_lost.store(true, Ordering::Relaxed);
+        }
+        result
+    }
+
+    // Poll at most once per pending submission. A consumer may hold the state mutex
+    // across an infinite wait; do not stall rendering on it. There is no pool mutex.
+    fn reap(&mut self) -> Result<(), vk::Result> {
+        let mut index = 0;
+        while index < self.pending.len() {
+            let retired = match self.pending[index].state.try_lock() {
+                Ok(mut state) => {
+                    state.poll(false, &self.pending[index].retired)?;
+                    state.take_retired()
+                }
+                Err(std::sync::TryLockError::WouldBlock) => None,
+                Err(std::sync::TryLockError::Poisoned(err)) => {
+                    let mut state = err.into_inner();
+                    state.poll(false, &self.pending[index].retired)?;
+                    state.take_retired()
+                }
+            };
+            if let Some(submission) = retired {
+                // State is now permanently Complete. Destroy images / return resources
+                // outside its lock, on the engine owner, not a KMS SyncPoint drop.
+                self.pending.swap_remove(index);
+                self.idle.push(submission.resources);
+                timing::count(Counter::BatchesRetired, 1);
+                timing::count(Counter::ResourceSetsRecycled, 1);
+            } else {
+                index += 1;
+            }
+        }
+        if self.core.device_lost.load(Ordering::Relaxed) {
+            return Err(vk::Result::ERROR_DEVICE_LOST);
+        }
+        Ok(())
+    }
+
+    fn copy_inner(
+        &mut self,
+        src: &Dmabuf,
+        dst: &Dmabuf,
+        acquire: &SyncPoint,
+        destination_release: Option<&SyncPoint>,
+        regions: &[Rectangle<i32, Buffer>],
+    ) -> Result<SyncPoint, VkBridgeError> {
         let validation_timing = timing::time(Stage::VulkanValidation);
         let format = validate(src, dst, regions)?;
         drop(validation_timing);
         let retire_timing = timing::time(Stage::VulkanRetire);
-        // Device loss is a real error, not a successfully completed frame.
-        for batch in &self.pending {
-            batch.complete()?;
-        }
-        self.pending.retain(|batch| !batch.complete().unwrap_or(false));
-        if self.pending.len() >= MAX_PENDING {
+        self.reap()?;
+        if pool_busy(self.pending.len()) {
+            timing::count(Counter::ResourcePoolBusy, 1);
             return Err(VkBridgeError::Busy);
         }
         drop(retire_timing);
         let source = self.import(src, format, true)?;
         let destination = self.import(dst, format, false)?;
         let resources_timing = timing::time(Stage::VulkanResources);
-        timing::count(Counter::BatchesCreated, 1);
-        let mut batch = Batch {
-            submitted: false,
-            resources: Some(Resources {
-                core: self.core.clone(),
-                _images: [source, destination],
-                // Imported SYNC_FD payloads own their dependency. CPU-waited inputs
-                // have retired. Retaining SyncPoints here would make fence chains
-                // retain every earlier batch, defeating bounded retirement.
-                pool: vk::CommandPool::null(),
-                fence: vk::Fence::null(),
-                semaphores: Vec::new(),
-            }),
+        let reused = !self.idle.is_empty();
+        let resources = match self.idle.pop() {
+            Some(resources) => resources,
+            None => Resources::new(self.core.clone())?,
         };
-        let r = batch.resources.as_mut().unwrap();
+        let mut checkout = Checkout {
+            idle: &mut self.idle,
+            resources: Some(resources),
+        };
+        let r = checkout.resources.as_mut().unwrap();
+        if reused {
+            r.reset()?;
+            timing::count(Counter::ResourceSetsReused, 1);
+        }
         let device = &self.core.device;
-        r.pool = unsafe {
-            device.create_command_pool(
-                &vk::CommandPoolCreateInfo::default().queue_family_index(self.core.family),
-                None,
-            )
-        }?;
-        r.fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }?;
         drop(resources_timing);
         let input_timing = timing::time(Stage::VulkanInputSetup);
-        let mut waits = Vec::new();
-        for input in std::iter::once(acquire).chain(destination_release) {
+        let mut waits = [vk::Semaphore::null(); 2];
+        let mut wait_count = 0;
+        for (index, input) in std::iter::once(acquire).chain(destination_release).enumerate() {
             if !input.contains_fence() {
                 continue;
             }
             let mut imported = false;
             if self.core.import_sync_fd {
                 if let Some(fd) = input.export() {
-                    let sem = unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?;
-                    r.semaphores.push(sem);
+                    let sem = r.waits[index];
                     let info = vk::ImportSemaphoreFdInfoKHR::default()
                         .semaphore(sem)
                         .flags(vk::SemaphoreImportFlags::TEMPORARY)
                         .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
                         .fd(fd.as_raw_fd());
-                    if unsafe {
+                    r.dirty_waits[index] = true;
+                    match unsafe {
                         self.core
                             .semaphore_fd
                             .as_ref()
                             .unwrap()
                             .import_semaphore_fd(&info)
-                    }
-                    .is_ok()
-                    {
-                        // Vulkan owns the descriptor only after a successful import.
-                        let _ = fd.into_raw_fd();
-                        waits.push(sem);
-                        imported = true;
-                        timing::count(Counter::NativeInputImports, 1);
+                    } {
+                        Ok(()) => {
+                            // Vulkan owns the descriptor only after a successful import.
+                            let _ = fd.into_raw_fd();
+                            waits[wait_count] = sem;
+                            wait_count += 1;
+                            imported = true;
+                            timing::count(Counter::NativeInputImports, 1);
+                        }
+                        Err(vk::Result::ERROR_DEVICE_LOST) => {
+                            return Err(vk::Result::ERROR_DEVICE_LOST.into());
+                        }
+                        Err(_) => {} // Keep the explicit CPU-wait fallback.
                     }
                 }
             }
@@ -582,44 +871,59 @@ impl VkBridge {
         }
         drop(input_timing);
         let signal_timing = timing::time(Stage::VulkanSignalSetup);
-        let mut signals = Vec::new();
-        if self.core.export_sync_fd {
-            let mut export = vk::ExportSemaphoreCreateInfo::default()
-                .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
-            let sem = unsafe {
-                device.create_semaphore(&vk::SemaphoreCreateInfo::default().push_next(&mut export), None)
-            }?;
-            r.semaphores.push(sem);
-            signals.push(sem);
-        }
+        let signal_storage = [r.signal];
+        let signals = &signal_storage[..usize::from(self.core.export_sync_fd)];
         drop(signal_timing);
         let record_timing = timing::time(Stage::VulkanRecord);
-        let command = unsafe {
-            device.allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(r.pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-        }?[0];
-        record(
-            &self.core,
-            command,
-            r._images[0].image,
-            r._images[1].image,
-            regions,
-        )?;
+        let command = r.command;
+        record(&self.core, command, source.image, destination.image, regions)?;
         drop(record_timing);
         let commands = [command];
-        let stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; waits.len()];
+        let waits = &waits[..wait_count];
+        let stages = [vk::PipelineStageFlags::ALL_COMMANDS; 2];
         let submit = vk::SubmitInfo::default()
             .command_buffers(&commands)
-            .wait_semaphores(&waits)
-            .wait_dst_stage_mask(&stages)
-            .signal_semaphores(&signals);
+            .wait_semaphores(waits)
+            .wait_dst_stage_mask(&stages[..wait_count])
+            .signal_semaphores(signals);
         let submit_timing = timing::time(Stage::VulkanSubmit);
-        unsafe { device.queue_submit(self.core.queue, &[submit], r.fence) }?;
-        batch.submitted = true;
+        // Allocate the logical owner BEFORE submission, including retained images. On
+        // success ownership must never return to the pre-submit Checkout guard.
+        let mut completion = Arc::new(Completion {
+            retired: AtomicBool::new(false),
+            state: Mutex::new(CompletionState::pending(Submission {
+                resources: checkout.resources.take().unwrap(),
+                _images: [source, destination],
+            })),
+        });
+        // Not published yet: unique access avoids a mutex across submit/export. Only
+        // errors guaranteeing unchanged submission state may use pre-submit rollback.
+        let state = Arc::get_mut(&mut completion)
+            .unwrap()
+            .state
+            .get_mut()
+            .unwrap_or_else(|err| err.into_inner());
+        let r = &mut state.owned.as_mut().unwrap().resources;
+        if let Err(err) = unsafe { device.queue_submit(self.core.queue, &[submit], r.fence) } {
+            if err == vk::Result::ERROR_DEVICE_LOST {
+                self.core.device_lost.store(true, Ordering::Relaxed);
+                // Loss can leave work submitted. Never put these handles into idle.
+                // Completion::drop performs this fence's actual wait before destruction;
+                // an unexpected wait failure leaks its complete ownership tree instead.
+                drop(completion);
+            } else {
+                let submission = state.owned.take().unwrap();
+                checkout.resources = Some(submission.resources);
+            }
+            return Err(err.into());
+        }
+        for (index, sem) in r.waits.iter().enumerate() {
+            if waits.contains(sem) {
+                r.dirty_waits[index] = false; // Temporary payload consumed before retirement.
+            }
+        }
+        r.dirty_signal = !signals.is_empty();
+        timing::count(Counter::BatchesCreated, 1);
         drop(submit_timing);
         // From this point there must be no fallible early return: caller must receive the
         // source-release fence even when native fd export fails after successful submission.
@@ -629,19 +933,24 @@ impl VkBridge {
                 .semaphore(sem)
                 .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
             match unsafe { self.core.semaphore_fd.as_ref().unwrap().get_semaphore_fd(&info) } {
-                Ok(fd) if fd >= 0 => Some(unsafe { OwnedFd::from_raw_fd(fd) }),
-                // -1 denotes an already-signaled payload. Keep using VkFence for retirement.
-                Ok(_) => None,
+                Ok(fd) => {
+                    // Copy export resets the semaphore payload, including fd == -1.
+                    // The owned fd is independent of all future semaphore/fence reuse.
+                    r.dirty_signal = false;
+                    (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd) })
+                }
                 Err(err) => {
+                    if err == vk::Result::ERROR_DEVICE_LOST {
+                        self.core.device_lost.store(true, Ordering::Relaxed);
+                    }
                     warn!(?err, "native copy fence export failed; using Vulkan wait");
                     None
                 }
             }
         });
         drop(export_timing);
-        let batch = Arc::new(batch);
-        self.pending.push(batch.clone());
-        Ok(TransferFence { batch, fd }.into())
+        self.pending.push(completion.clone());
+        Ok(TransferFence { completion, fd }.into())
     }
 
     fn import(
@@ -994,6 +1303,191 @@ fn record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_status_does_not_block_behind_a_waiting_consumer() {
+        // No driver is needed: the pending state remains locked until it is made terminal.
+        let completion = Arc::new(Completion {
+            state: Mutex::new(State {
+                outcome: Outcome::Pending,
+                owned: None,
+            }),
+            retired: AtomicBool::new(false),
+        });
+        let mut waiter = completion.state.lock().unwrap();
+        let fence = TransferFence {
+            completion: completion.clone(),
+            fd: None,
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let query = std::thread::spawn(move || sender.send(fence.is_signaled()).unwrap());
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(1));
+        // Always release before asserting, so a blocking regression fails without hanging.
+        waiter.outcome = Outcome::Complete;
+        assert_eq!(waiter.poll(false, &completion.retired), Ok(true));
+        drop(waiter);
+        query.join().unwrap();
+        assert_eq!(result, Ok(false));
+        assert!(completion.is_signaled());
+    }
+
+    #[test]
+    fn cached_terminal_status_stays_true_even_while_state_is_locked() {
+        for outcome in [Outcome::Complete, Outcome::DeviceLost] {
+            let completion = Arc::new(Completion {
+                state: Mutex::new(State { outcome, owned: None }),
+                retired: AtomicBool::new(false),
+            });
+            let mut owner = completion.state.lock().unwrap();
+            let result = owner.poll(false, &completion.retired);
+            assert!(matches!(result, Ok(true) | Err(vk::Result::ERROR_DEVICE_LOST)));
+            assert!(owner.take_retired().is_none());
+            let fence = TransferFence {
+                completion: completion.clone(),
+                fd: None,
+            };
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let query = std::thread::spawn(move || {
+                sender.send((fence.is_signaled(), fence.wait().is_ok())).unwrap();
+            });
+            let result = receiver.recv_timeout(std::time::Duration::from_secs(1));
+            drop(owner);
+            query.join().unwrap();
+            assert_eq!(result, Ok((true, true)));
+            assert!(completion.is_signaled());
+        }
+    }
+
+    #[test]
+    fn old_completion_stays_true_after_resource_reuse_and_engine_retirement() {
+        let old = Arc::new(Mutex::new(CompletionState::pending(7usize)));
+        let retained = old.clone();
+        let resource = {
+            let mut state = old.lock().unwrap();
+            assert_eq!(state.observe(Ok(true)), Ok(true));
+            state.take_retired().unwrap()
+        };
+        let mut next = CompletionState::pending(resource);
+        assert_eq!(next.observe(Ok(false)), Ok(false));
+        drop(old); // Engine no longer keeps this logical completion.
+        let mut old = retained.lock().unwrap();
+        assert_eq!(old.observe(Ok(false)), Ok(true));
+        assert_eq!(old.observe(Err(vk::Result::ERROR_DEVICE_LOST)), Ok(true));
+        assert!(old.owned.is_none());
+        assert!(old.take_retired().is_none());
+        assert_eq!(next.observe(Ok(true)), Ok(true));
+        assert_eq!(next.take_retired(), Some(7));
+    }
+
+    #[test]
+    fn pending_and_unexpected_errors_cannot_release_ownership() {
+        let owner = Arc::new(());
+        let mut state = CompletionState::pending(owner.clone());
+        assert_eq!(state.observe(Ok(false)), Ok(false));
+        assert!(state.take_retired().is_none());
+        assert_eq!(
+            state.observe(Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY)),
+            Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY)
+        );
+        assert_eq!(state.outcome, Outcome::Pending);
+        assert!(state.take_retired().is_none());
+        assert_eq!(Arc::strong_count(&owner), 2);
+        assert_eq!(state.observe(Ok(true)), Ok(true));
+        drop(state.take_retired());
+        assert_eq!(Arc::strong_count(&owner), 1);
+    }
+
+    #[test]
+    fn loss_freezes_retired_access_without_becoming_success() {
+        let mut state = CompletionState::pending(5usize);
+        assert_eq!(
+            state.observe(Err(vk::Result::ERROR_DEVICE_LOST)),
+            Err(vk::Result::ERROR_DEVICE_LOST)
+        );
+        assert_eq!(state.outcome, Outcome::DeviceLost);
+        // Owner may destroy, not recycle: reap propagates this error before extraction.
+        assert_eq!(state.observe(Ok(true)), Err(vk::Result::ERROR_DEVICE_LOST));
+        assert_eq!(state.take_retired(), Some(5));
+        assert_eq!(state.observe(Ok(false)), Err(vk::Result::ERROR_DEVICE_LOST));
+        assert!(state.take_retired().is_none());
+    }
+
+    #[test]
+    fn waiting_consumer_prevents_nonblocking_reaper_extraction() {
+        let state = Arc::new(Mutex::new(CompletionState::pending(9usize)));
+        let consumer = state.lock().unwrap();
+        let engine = state.clone();
+        std::thread::spawn(move || {
+            assert!(matches!(
+                engine.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+        })
+        .join()
+        .unwrap();
+        drop(consumer);
+        let mut engine = state.try_lock().unwrap();
+        assert!(engine.take_retired().is_none());
+        assert_eq!(engine.observe(Ok(true)), Ok(true));
+        assert_eq!(engine.take_retired(), Some(9));
+    }
+
+    #[test]
+    fn pre_submit_guard_returns_slot_on_error_but_not_after_submission() {
+        let mut idle = vec![3usize];
+        let result: Result<(), ()> = (|| {
+            let resources = idle.pop();
+            let _checkout = Checkout {
+                idle: &mut idle,
+                resources,
+            };
+            Err(())?;
+            Ok(())
+        })();
+        assert!(result.is_err());
+        assert_eq!(idle, [3]);
+        let resources = idle.pop();
+        let mut checkout = Checkout {
+            idle: &mut idle,
+            resources,
+        };
+        let submitted = checkout.resources.take().unwrap();
+        drop(checkout);
+        assert!(idle.is_empty());
+        assert_eq!(submitted, 3);
+    }
+
+    #[test]
+    fn bounded_slots_recycle_with_arbitrarily_retained_old_completions() {
+        let mut idle = Vec::new();
+        let mut pending = Vec::new();
+        let mut old = Vec::new();
+        let mut created = 0;
+        for _ in 0..32 {
+            while !pool_busy(pending.len()) {
+                let resource = idle.pop().unwrap_or_else(|| {
+                    created += 1;
+                    created
+                });
+                pending.push(CompletionState::pending(resource));
+                assert!(idle.len() + pending.len() <= MAX_PENDING);
+            }
+            assert_eq!(pending.len(), MAX_PENDING);
+            for mut state in pending.drain(..) {
+                assert!(state.take_retired().is_none());
+                assert_eq!(state.observe(Ok(true)), Ok(true));
+                idle.push(state.take_retired().unwrap());
+                old.push(state);
+            }
+        }
+        assert_eq!(created, MAX_PENDING);
+        assert_eq!(idle.len(), MAX_PENDING);
+        assert_eq!(old.len(), 32 * MAX_PENDING);
+        assert!(
+            old.iter_mut()
+                .all(|state| state.owned.is_none() && state.observe(Ok(false)) == Ok(true))
+        );
+    }
 
     #[test]
     fn modifier_negotiation_requires_explicit_single_plane_and_exact_usage() {

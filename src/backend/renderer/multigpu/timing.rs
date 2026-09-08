@@ -62,7 +62,8 @@ names! {
         CpuGlesWait, VulkanValidation, VulkanResources, ImportedDestroy, DeviceDestroy,
         BatchDestroy, TransferRetire, TransferWait, GlesFinish, TargetTextureImport,
         NiriRedraw, NiriCallbacks, NiriScreenCast, VulkanSignalSetup,
-        QueueReturnLead, QueueReturnLate, NiriSceneUpdate, NiriVblank, NiriPresentRetire
+        QueueReturnLead, QueueReturnLate, NiriSceneUpdate, NiriVblank, NiriPresentRetire,
+        VulkanPoolReset
     }
 }
 names! {
@@ -74,7 +75,9 @@ names! {
         SourceImportMisses, TargetImportMisses, NativeInputImports, CpuInputWaits,
         CpuGlesWaits, GlesFinishFallbacks, BatchesCreated, BatchesRetired, TextureCopies,
         StreamRegistrations, QueueReturnedPastDeadline, FuturePresentationTimestamp,
-        TransitionPresentationsIgnored
+        TransitionPresentationsIgnored, ResourceSetsCreated, ResourceSetsReused,
+        ResourceSetsRecycled, ResourceSetsDestroyed, ResourcePoolBusy,
+        SignalSemaphoresReplaced
     }
 }
 
