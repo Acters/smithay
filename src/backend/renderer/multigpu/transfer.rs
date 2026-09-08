@@ -12,7 +12,10 @@ use crate::utils::{Buffer, Rectangle, Size};
 use std::collections::HashSet;
 use tracing::warn;
 
-use super::vkbridge::{VkBridge, VkBridgeError};
+use super::{
+    timing::{self, Stage},
+    vkbridge::{VkBridge, VkBridgeError},
+};
 
 #[derive(Debug, Default)]
 enum Engine {
@@ -138,6 +141,7 @@ impl TransferState {
     }
 
     fn retire_buffers(&mut self) {
+        let _timing = timing::time(Stage::TransferRetire);
         // This runs only when replacing/invalidation drops storage, not for each frame.
         // A source copy fence and the downstream target-reader fence protect different
         // allocations; neither can stand in for the other.
@@ -185,6 +189,7 @@ pub(super) fn cache_direct_rejection(error: &VkBridgeError) -> bool {
 }
 
 pub(super) fn wait(sync: &SyncPoint) {
+    let _timing = timing::time(Stage::TransferWait);
     // Interrupted explicitly means retry, not completion (the Fence contract).
     while sync.wait().is_err() {}
 }

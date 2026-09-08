@@ -15,6 +15,7 @@ use std::{
     sync::Arc,
 };
 
+use super::timing::{self, Counter, Stage};
 use ash::{ext, khr, vk};
 use tracing::warn;
 
@@ -141,6 +142,7 @@ impl Core {
 
 impl Drop for Core {
     fn drop(&mut self) {
+        let _timing = timing::time(Stage::DeviceDestroy);
         // Every image and batch owns this core. The last reference can disappear only after
         // all submitted batches have retired; no global queue-idle wait is needed here.
         unsafe { self.device.destroy_device(None) };
@@ -158,6 +160,7 @@ struct Imported {
 
 impl Drop for Imported {
     fn drop(&mut self) {
+        let _timing = timing::time(Stage::ImportedDestroy);
         unsafe {
             self.core.device.destroy_image(self.image, None);
             self.core.device.free_memory(self.memory, None);
@@ -177,6 +180,7 @@ struct Resources {
 
 impl Drop for Resources {
     fn drop(&mut self) {
+        let _timing = timing::time(Stage::ResourcesDestroy);
         unsafe {
             for sem in self.semaphores.drain(..) {
                 self.core.device.destroy_semaphore(sem, None);
@@ -203,6 +207,7 @@ impl Batch {
     }
 
     fn wait(&self) -> Result<(), vk::Result> {
+        let _timing = timing::time(Stage::VulkanFenceWait);
         let r = self.resources();
         unsafe { r.core.device.wait_for_fences(&[r.fence], true, u64::MAX) }
     }
@@ -210,9 +215,12 @@ impl Batch {
 
 impl Drop for Batch {
     fn drop(&mut self) {
+        let _timing = timing::time(Stage::BatchDestroy);
         if self.submitted {
             match self.wait() {
-                Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => {}
+                Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => {
+                    timing::count(Counter::BatchesRetired, 1);
+                }
                 Err(err) => {
                     // An unexpected host-side wait failure is NOT completion. Leak the whole
                     // ownership tree rather than free resources the GPU might still access.
@@ -492,7 +500,11 @@ impl VkBridge {
         destination_release: Option<&SyncPoint>,
         regions: &[Rectangle<i32, Buffer>],
     ) -> Result<SyncPoint, VkBridgeError> {
+        let _copy_timing = timing::time(Stage::VulkanCopy);
+        let validation_timing = timing::time(Stage::VulkanValidation);
         let format = validate(src, dst, regions)?;
+        drop(validation_timing);
+        let retire_timing = timing::time(Stage::VulkanRetire);
         // Device loss is a real error, not a successfully completed frame.
         for batch in &self.pending {
             batch.complete()?;
@@ -501,8 +513,11 @@ impl VkBridge {
         if self.pending.len() >= MAX_PENDING {
             return Err(VkBridgeError::Busy);
         }
+        drop(retire_timing);
         let source = self.import(src, format, true)?;
         let destination = self.import(dst, format, false)?;
+        let resources_timing = timing::time(Stage::VulkanResources);
+        timing::count(Counter::BatchesCreated, 1);
         let mut batch = Batch {
             submitted: false,
             resources: Some(Resources {
@@ -525,6 +540,8 @@ impl VkBridge {
             )
         }?;
         r.fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }?;
+        drop(resources_timing);
+        let input_timing = timing::time(Stage::VulkanInputSetup);
         let mut waits = Vec::new();
         for input in std::iter::once(acquire).chain(destination_release) {
             if !input.contains_fence() {
@@ -553,13 +570,18 @@ impl VkBridge {
                         let _ = fd.into_raw_fd();
                         waits.push(sem);
                         imported = true;
+                        timing::count(Counter::NativeInputImports, 1);
                     }
                 }
             }
             if !imported {
+                timing::count(Counter::CpuInputWaits, 1);
+                let _wait_timing = timing::time(Stage::CpuInputFenceWait);
                 input.wait()?;
             }
         }
+        drop(input_timing);
+        let signal_timing = timing::time(Stage::VulkanSignalSetup);
         let mut signals = Vec::new();
         if self.core.export_sync_fd {
             let mut export = vk::ExportSemaphoreCreateInfo::default()
@@ -570,6 +592,8 @@ impl VkBridge {
             r.semaphores.push(sem);
             signals.push(sem);
         }
+        drop(signal_timing);
+        let record_timing = timing::time(Stage::VulkanRecord);
         let command = unsafe {
             device.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
@@ -585,6 +609,7 @@ impl VkBridge {
             r._images[1].image,
             regions,
         )?;
+        drop(record_timing);
         let commands = [command];
         let stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; waits.len()];
         let submit = vk::SubmitInfo::default()
@@ -592,10 +617,13 @@ impl VkBridge {
             .wait_semaphores(&waits)
             .wait_dst_stage_mask(&stages)
             .signal_semaphores(&signals);
+        let submit_timing = timing::time(Stage::VulkanSubmit);
         unsafe { device.queue_submit(self.core.queue, &[submit], r.fence) }?;
         batch.submitted = true;
+        drop(submit_timing);
         // From this point there must be no fallible early return: caller must receive the
         // source-release fence even when native fd export fails after successful submission.
+        let export_timing = timing::time(Stage::VulkanExport);
         let fd = signals.first().and_then(|&sem| {
             let info = vk::SemaphoreGetFdInfoKHR::default()
                 .semaphore(sem)
@@ -610,6 +638,7 @@ impl VkBridge {
                 }
             }
         });
+        drop(export_timing);
         let batch = Arc::new(batch);
         self.pending.push(batch.clone());
         Ok(TransferFence { batch, fd }.into())
@@ -621,6 +650,11 @@ impl VkBridge {
         format: vk::Format,
         source: bool,
     ) -> Result<Arc<Imported>, VkBridgeError> {
+        let _timing = timing::time(if source {
+            Stage::SourceImport
+        } else {
+            Stage::TargetImport
+        });
         if let Some(index) = self
             .imports
             .iter()
@@ -630,6 +664,14 @@ impl VkBridge {
             self.imports.push_back(image.clone());
             return Ok(image);
         }
+        timing::count(
+            if source {
+                Counter::SourceImportMisses
+            } else {
+                Counter::TargetImportMisses
+            },
+            1,
+        );
         let core = &self.core;
         let usage = if source {
             vk::ImageUsageFlags::TRANSFER_SRC

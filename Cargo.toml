@@ -138,6 +138,10 @@ name = "vulkan_transfer"
 required-features = ["backend_gbm", "renderer_gl", "renderer_multi", "backend_vulkan"]
 
 [[example]]
+name = "frame_timing_overhead"
+required-features = ["renderer_multi"]
+
+[[example]]
 name = "buffer_test"
 required-features = ["backend_drm", "backend_gbm", "backend_egl", "backend_vulkan", "renderer_gl"]
 

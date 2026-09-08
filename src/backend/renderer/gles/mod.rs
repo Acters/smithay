@@ -998,7 +998,17 @@ impl ImportMemWl for GlesRenderer {
                 if self.capabilities.contains(&Capability::Fencing) {
                     sync_lock.update_write(&self.gl);
                 } else if self.egl.is_shared() {
-                    self.gl.Finish();
+                    {
+                        #[cfg(feature = "renderer_multi")]
+                        let _finish_timing = {
+                            super::multigpu::timing::count(
+                                super::multigpu::timing::Counter::GlesFinishFallbacks,
+                                1,
+                            );
+                            super::multigpu::timing::time(super::multigpu::timing::Stage::GlesFinish)
+                        };
+                        self.gl.Finish();
+                    }
                 }
             }
             std::mem::drop(sync_lock);
@@ -1093,7 +1103,17 @@ impl ImportMem for GlesRenderer {
                 sync.get_mut().unwrap().update_write(&self.gl);
             } else if self.egl.is_shared() {
                 unsafe {
-                    self.gl.Finish();
+                    {
+                        #[cfg(feature = "renderer_multi")]
+                        let _finish_timing = {
+                            super::multigpu::timing::count(
+                                super::multigpu::timing::Counter::GlesFinishFallbacks,
+                                1,
+                            );
+                            super::multigpu::timing::time(super::multigpu::timing::Stage::GlesFinish)
+                        };
+                        self.gl.Finish();
+                    }
                 }
             };
 
@@ -1169,7 +1189,17 @@ impl ImportMem for GlesRenderer {
             if self.capabilities.contains(&Capability::Fencing) {
                 sync_lock.update_write(&self.gl);
             } else if self.egl.is_shared() {
-                self.gl.Finish();
+                {
+                    #[cfg(feature = "renderer_multi")]
+                    let _finish_timing = {
+                        super::multigpu::timing::count(
+                            super::multigpu::timing::Counter::GlesFinishFallbacks,
+                            1,
+                        );
+                        super::multigpu::timing::time(super::multigpu::timing::Stage::GlesFinish)
+                    };
+                    self.gl.Finish();
+                }
             }
         }
 
@@ -1926,7 +1956,17 @@ impl Blit for GlesRenderer {
             self.profiler.sync_gpu(&self.gl);
 
             unsafe {
-                self.gl.Finish();
+                {
+                    #[cfg(feature = "renderer_multi")]
+                    let _finish_timing = {
+                        super::multigpu::timing::count(
+                            super::multigpu::timing::Counter::GlesFinishFallbacks,
+                            1,
+                        );
+                        super::multigpu::timing::time(super::multigpu::timing::Stage::GlesFinish)
+                    };
+                    self.gl.Finish();
+                }
             }
             Ok(SyncPoint::signaled())
         }
@@ -2340,6 +2380,8 @@ impl Renderer for GlesRenderer {
         &mut self,
         framebuffer: &mut Self::Framebuffer<'_>,
     ) -> Result<Option<super::ExternalFramebufferWrite>, Self::Error> {
+        #[cfg(feature = "renderer_multi")]
+        let _timing = super::multigpu::timing::time(super::multigpu::timing::Stage::TargetAcquire);
         let dmabuf = match &framebuffer.0 {
             // Clone only the ORIGINAL allocation recorded by Bind<Dmabuf>. Its common
             // texture-backed path must participate, but arbitrary Bind<GlesTexture> targets
@@ -2364,6 +2406,8 @@ impl Renderer for GlesRenderer {
         framebuffer: &mut Self::Framebuffer<'_>,
         completion: &SyncPoint,
     ) -> Result<(), Self::Error> {
+        #[cfg(feature = "renderer_multi")]
+        let _timing = super::multigpu::timing::time(super::multigpu::timing::Stage::TargetPublish);
         self.wait(completion)?;
         if matches!(
             &framebuffer.0,
@@ -2382,6 +2426,8 @@ impl Renderer for GlesRenderer {
 
     #[profiling::function]
     fn wait(&mut self, sync: &super::sync::SyncPoint) -> Result<(), Self::Error> {
+        #[cfg(feature = "renderer_multi")]
+        let _timing = super::multigpu::timing::time(super::multigpu::timing::Stage::GlesWait);
         unsafe {
             self.egl.make_current()?;
         }
@@ -2412,6 +2458,14 @@ impl Renderer for GlesRenderer {
 
         // if everything above failed we can only
         // block until the sync point has been reached
+        #[cfg(feature = "renderer_multi")]
+        let _cpu_timing = if sync.contains_fence() {
+            // Count fence fallback invocations, not necessarily blocking waits.
+            super::multigpu::timing::count(super::multigpu::timing::Counter::CpuGlesWaits, 1);
+            super::multigpu::timing::time(super::multigpu::timing::Stage::CpuGlesWait)
+        } else {
+            None
+        };
         sync.wait().map_err(|_| GlesError::SyncInterrupted)
     }
 
@@ -2654,6 +2708,11 @@ impl GlesFrame<'_, '_> {
 
         // as a last option we force finish, this is unlikely to happen
         unsafe {
+            #[cfg(feature = "renderer_multi")]
+            let _finish_timing = {
+                super::multigpu::timing::count(super::multigpu::timing::Counter::GlesFinishFallbacks, 1);
+                super::multigpu::timing::time(super::multigpu::timing::Stage::GlesFinish)
+            };
             self.renderer.gl.Finish();
         }
         Ok(SyncPoint::signaled())
@@ -3156,6 +3215,11 @@ impl GlesFrame<'_, '_> {
             if self.renderer.capabilities.contains(&Capability::Fencing) {
                 sync_lock.update_read(gl);
             } else if self.renderer.egl.is_shared() {
+                #[cfg(feature = "renderer_multi")]
+                let _finish_timing = {
+                    super::multigpu::timing::count(super::multigpu::timing::Counter::GlesFinishFallbacks, 1);
+                    super::multigpu::timing::time(super::multigpu::timing::Stage::GlesFinish)
+                };
                 gl.Finish();
             };
         }

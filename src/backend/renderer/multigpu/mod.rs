@@ -83,6 +83,8 @@ pub mod gbm;
 mod transfer;
 #[cfg(feature = "backend_vulkan")]
 pub mod vkbridge;
+
+pub mod timing;
 #[cfg(feature = "backend_vulkan")]
 use transfer::TransferState;
 
@@ -1508,10 +1510,12 @@ where
                     state.set_source(dmabuf);
                     // A previous copy may still be reading this allocation. Queue a
                     // GPU wait before any further GLES writes, including partial frames.
+                    let source_wait_timing = timing::time(timing::Stage::SourceReuseWait);
                     self.render
                         .renderer_mut()
                         .wait(&state.source_release)
                         .map_err(Error::Render)?;
+                    drop(source_wait_timing);
                     if !*direct {
                         let _ = state.engine(*self.render.node());
                     }
@@ -1772,6 +1776,7 @@ where
             let render = unsafe { &mut *self.render };
             #[cfg(feature = "backend_vulkan")]
             if let Some(state) = self.target.as_ref().and_then(|target| target.transfer.as_deref()) {
+                let _source_wait_timing = timing::time(timing::Stage::SourceReuseWait);
                 render
                     .renderer_mut()
                     .wait(&state.source_release)
@@ -1852,6 +1857,7 @@ where
             let buffer_size = self.size.to_logical(1).to_buffer(1, Transform::Normal);
             if let Some(target) = self.target.as_mut() {
                 if let Some(texture) = target.texture.as_ref() {
+                    timing::count(timing::Counter::TextureCopies, 1);
                     // try gpu copy
                     let damage = damage
                         .iter()
@@ -1966,6 +1972,7 @@ where
                                                 Ok(copy_sync) => {
                                                     // Store ownership immediately: even a subsequent
                                                     // target wait/cleanup failure must retire this copy.
+                                                    timing::count(timing::Counter::DirectCopies, 1);
                                                     state.source_release = copy_sync.clone();
                                                     debug!(
                                                         source = ?self.node,
@@ -2072,11 +2079,13 @@ where
                             };
                             // Probe target import before submitting any writes. This is an
                             // intermediate texture, not a scanout buffer or a previous frame.
-                            let texture = match target
+                            let target_import_timing = timing::time(timing::Stage::TargetTextureImport);
+                            let target_import_result = target
                                 .device
                                 .renderer_mut()
-                                .import_dmabuf(&destination, Some(&copy_rects))
-                            {
+                                .import_dmabuf(&destination, Some(&copy_rects));
+                            drop(target_import_timing);
+                            let texture = match target_import_result {
                                 Ok(texture) => texture,
                                 Err(err) => {
                                     warn!("Vulkan transfer target import failed, using CPU copy: {err}");
@@ -2106,6 +2115,7 @@ where
                                 }
                             };
                             debug!(source = ?self.node, target = ?target.device.node(), native_fence = copy_sync.is_exportable(), "submitted same-frame Vulkan transfer");
+                            timing::count(timing::Counter::IntermediateCopies, 1);
                             state.source_release = copy_sync.clone();
                             let result = (|| {
                                 let mut frame = target
@@ -2160,6 +2170,7 @@ where
                     }
                 }
 
+                timing::count(timing::Counter::CpuCopies, u64::from(!copy_rects.is_empty()));
                 let mut mappings = Vec::new();
                 for rect in copy_rects {
                     let mapping = (
