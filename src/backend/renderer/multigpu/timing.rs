@@ -77,7 +77,7 @@ names! {
         StreamRegistrations, QueueReturnedPastDeadline, FuturePresentationTimestamp,
         TransitionPresentationsIgnored, ResourceSetsCreated, ResourceSetsReused,
         ResourceSetsRecycled, ResourceSetsDestroyed, ResourcePoolBusy,
-        SignalSemaphoresReplaced
+        SignalSemaphoresReplaced, SequenceUnchanged
     }
 }
 
