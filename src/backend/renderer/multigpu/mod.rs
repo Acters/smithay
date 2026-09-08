@@ -122,6 +122,8 @@ pub struct GpuManager<A: GraphicsApi> {
     #[cfg(feature = "backend_vulkan")]
     vulkan_direct_target_enabled: bool,
     #[cfg(feature = "backend_vulkan")]
+    vulkan_source_detile_enabled: bool,
+    #[cfg(feature = "backend_vulkan")]
     vulkan_copy_device: VulkanCopyDevice,
     #[cfg(feature = "backend_vulkan")]
     transfer_generation: Arc<()>,
@@ -273,6 +275,7 @@ impl<A: GraphicsApi> GpuManager<A> {
         pair: (DrmNode, DrmNode),
         source_generation: Arc<()>,
         direct_target_enabled: bool,
+        source_detile_enabled: bool,
         copy_device: VulkanCopyDevice,
     ) {
         let stale = self
@@ -286,6 +289,7 @@ impl<A: GraphicsApi> GpuManager<A> {
         let state = self.transfers.entry(pair).or_default();
         state.source_generation = Some(source_generation);
         state.direct_target_enabled = direct_target_enabled;
+        state.source_detile_enabled = source_detile_enabled;
         state.copy_device = copy_device;
     }
 
@@ -313,6 +317,23 @@ impl<A: GraphicsApi> GpuManager<A> {
             self.reset_transfer_storage();
             self.vulkan_direct_target_enabled = enabled;
         }
+    }
+
+    /// Opt in to source-owned Vulkan detiling before target-owned copies.
+    /// Effective only with Target copy ownership and direct transfers enabled.
+    /// Changing policy retires storage and advances the cross-manager source epoch.
+    #[cfg(feature = "backend_vulkan")]
+    pub fn set_vulkan_source_detile_enabled(&mut self, enabled: bool) {
+        if self.vulkan_source_detile_enabled != enabled {
+            self.reset_transfer_storage();
+            self.vulkan_source_detile_enabled = enabled;
+        }
+    }
+
+    /// Whether source detiling has been requested (not necessarily available).
+    #[cfg(feature = "backend_vulkan")]
+    pub fn vulkan_source_detile_enabled(&self) -> bool {
+        self.vulkan_source_detile_enabled
     }
 
     /// Select the copy engine owner, retiring storage and advancing the opaque epoch.
@@ -358,6 +379,7 @@ impl<A: GraphicsApi> GpuManager<A> {
             (*render, *target),
             self.transfer_generation.clone(),
             self.vulkan_direct_target_enabled,
+            self.vulkan_source_detile_enabled,
             self.vulkan_copy_device,
         );
         if !self.vulkan_transfer_enabled || render == target {
@@ -368,7 +390,13 @@ impl<A: GraphicsApi> GpuManager<A> {
             return Err(Error::DeviceMissing);
         }
         let node = state.copy_node(*render, *target);
-        let caps = state.destination_modifiers(node, format, size);
+        let mut caps = state.destination_modifiers(node, format, size);
+        if state.detile_active() {
+            let _ = state.render_modifiers(*render, *target, format, size);
+            if state.detile_initialization_pending() {
+                caps = None;
+            }
+        }
         if state.device_lost {
             return Err(Error::DeviceMissing);
         }
@@ -392,6 +420,8 @@ impl<A: GraphicsApi> GpuManager<A> {
             vulkan_transfer_enabled: true,
             #[cfg(feature = "backend_vulkan")]
             vulkan_direct_target_enabled: false,
+            #[cfg(feature = "backend_vulkan")]
+            vulkan_source_detile_enabled: false,
             #[cfg(feature = "backend_vulkan")]
             vulkan_copy_device: VulkanCopyDevice::default(),
             #[cfg(feature = "backend_vulkan")]
@@ -527,6 +557,7 @@ impl<A: GraphicsApi> GpuManager<A> {
             (*render_device, *target_device),
             self.transfer_generation.clone(),
             self.vulkan_direct_target_enabled,
+            self.vulkan_source_detile_enabled,
             self.vulkan_copy_device,
         );
         let (mut render, others) = self
@@ -637,6 +668,7 @@ impl<A: GraphicsApi> GpuManager<A> {
             (*render_device, *target_device),
             render_api.transfer_generation.clone(),
             render_api.vulkan_direct_target_enabled,
+            render_api.vulkan_source_detile_enabled,
             render_api.vulkan_copy_device,
         );
         let (mut render, others) = render_api
@@ -1471,20 +1503,47 @@ where
                 }
                 if state.prefers_direct() || target.cached_buffer.as_ref().is_some_and(|(direct, _)| !direct)
                 {
-                    let node = state.copy_node(*self.render.node(), *target.device.node());
-                    transfer_modifiers = state.source_modifiers(node, target.format, buffer_size);
+                    transfer_modifiers = state.render_modifiers(
+                        *self.render.node(),
+                        *target.device.node(),
+                        target.format,
+                        buffer_size,
+                    );
                     if state.device_lost {
                         return Err(Error::DeviceMissing);
                     }
                 }
             }
             #[cfg(feature = "backend_vulkan")]
-            if let (Some(modifiers), Some((_, old))) = (&transfer_modifiers, &target.cached_buffer) {
-                if !modifiers.is_empty()
-                    && !modifiers.contains(&old.format().modifier)
-                    && old.size() == buffer_size
-                    && old.format().code == target.format
-                {
+            if let Some(modifiers) = &transfer_modifiers {
+                // Treat a wrong-format/extent allocation as cold for negotiation,
+                // but retain it until the replacement transaction succeeds.
+                let old = target
+                    .cached_buffer
+                    .as_ref()
+                    .map(|(_, old)| old)
+                    .filter(|old| old.size() == buffer_size && old.format().code == target.format);
+                let detile_ready = target
+                    .transfer
+                    .as_deref()
+                    .is_some_and(|state| state.detile_route_ready(target.format, buffer_size));
+                let linear_compatible = target
+                    .transfer
+                    .as_deref()
+                    .and_then(|state| state.linear.as_ref())
+                    .is_some_and(|linear| {
+                        linear.format().modifier == Modifier::Linear
+                            && linear.format().code == target.format
+                            && linear.size() == buffer_size
+                            && linear.num_planes() == 1
+                            && old.is_some_and(|old| linear.y_inverted() == old.y_inverted())
+                    });
+                if transfer::source_allocation_needed(
+                    modifiers,
+                    old.map(|old| old.format().modifier),
+                    detile_ready,
+                    linear_compatible,
+                ) {
                     // Negotiate and bind a candidate before releasing a still-valid shared
                     // source. A failed optimization must retain its actual-current fallback.
                     let supported =
@@ -1500,6 +1559,28 @@ where
                         .collect::<Vec<_>>();
                     if !modifiers.is_empty() {
                         let candidate = (|| {
+                            let linear = if detile_ready {
+                                let linear = self
+                                    .render
+                                    .allocator()
+                                    .create_buffer(
+                                        buffer_size.w as u32,
+                                        buffer_size.h as u32,
+                                        target.format,
+                                        &[Modifier::Linear],
+                                    )
+                                    .map_err(Error::AllocatorError)?;
+                                if linear.format().modifier != Modifier::Linear
+                                    || linear.format().code != target.format
+                                    || linear.size() != buffer_size
+                                    || linear.num_planes() != 1
+                                {
+                                    return Err(Error::<R, T>::ImportFailed);
+                                }
+                                Some(linear)
+                            } else {
+                                None
+                            };
                             let mut candidate = self
                                 .render
                                 .allocator()
@@ -1528,10 +1609,20 @@ where
                                     .render(&mut fb, size, dst_transform)
                                     .map_err(Error::Render)?;
                             }
-                            Ok(candidate)
+                            if linear
+                                .as_ref()
+                                .is_some_and(|l| l.y_inverted() != candidate.y_inverted())
+                            {
+                                return Err(Error::<R, T>::ImportFailed);
+                            }
+                            Ok((candidate, linear))
                         })();
                         match candidate {
-                            Ok(candidate) => {
+                            Ok((candidate, linear)) => {
+                                if let Some(state) = target.transfer.as_deref_mut() {
+                                    state.set_source(&candidate);
+                                    state.linear = linear;
+                                }
                                 let shared = target
                                     .device
                                     .renderer_mut()
@@ -1539,7 +1630,14 @@ where
                                     .is_ok();
                                 *target.cached_buffer = Some((shared, candidate));
                             }
-                            Err(err) => debug!(?err, "keeping valid source after Vulkan candidate rejection"),
+                            Err(err) => {
+                                if let Some(state) = target.transfer.as_deref_mut() {
+                                    if state.detile_active() {
+                                        state.defer_detile(target.format, buffer_size);
+                                    }
+                                }
+                                debug!(?err, "keeping valid source after Vulkan candidate rejection");
+                            }
                         }
                     }
                 }
@@ -1552,6 +1650,15 @@ where
             };
 
             if target.cached_buffer.is_none() {
+                // Native S+L was unavailable or its transaction failed. Establish
+                // the single-copy/shared baseline without forcing a native source.
+                #[cfg(feature = "backend_vulkan")]
+                if let Some(state) = target.transfer.as_deref_mut() {
+                    if state.detile_active() {
+                        let node = state.copy_node(*self.render.node(), *target.device.node());
+                        transfer_modifiers = state.source_modifiers(node, target.format, buffer_size);
+                    }
+                }
                 match create_shared_dma_framebuffer::<R, T>(buffer_size, self.render, target) {
                     Ok(dmabuf) => {
                         *target.cached_buffer = Some((true, dmabuf));
@@ -2040,6 +2147,48 @@ where
                 }
 
                 #[cfg(feature = "backend_vulkan")]
+                let mut input = transfer::PreparedTransferInput {
+                    dmabuf: target.source.clone(),
+                    acquire: sync.clone(),
+                    detiled: false,
+                };
+                #[cfg(feature = "backend_vulkan")]
+                let exact_damage = transfer::direct_damage(&damage, buffer_size);
+                #[cfg(feature = "backend_vulkan")]
+                let mut detile_texture = None;
+                #[cfg(feature = "backend_vulkan")]
+                if !exact_damage.is_empty() {
+                    if let Some(state) = target.transfer.as_deref_mut() {
+                        if state.detile_active() && target.source.format().modifier != Modifier::Linear {
+                            if let Some(linear) = state.linear.clone() {
+                                let release = state.linear_release.clone();
+                                let result = state.detile_engine(self.node).map(|engine| {
+                                    let _timing = timing::time(timing::Stage::DetileCopy);
+                                    engine.copy(&target.source, &linear, &sync, Some(&release), &exact_damage)
+                                });
+                                match result {
+                                    Some(Ok(f1)) => {
+                                        // Publish BOTH owners before any fallible second-leg work.
+                                        state.record_detile(f1.clone());
+                                        timing::count(timing::Counter::DetileCopies, 1);
+                                        input = transfer::PreparedTransferInput {
+                                            dmabuf: linear,
+                                            acquire: f1,
+                                            detiled: true,
+                                        };
+                                    }
+                                    Some(Err(err)) if err.is_device_lost() => {
+                                        state.device_lost = true;
+                                        state.disable();
+                                        return Err(Error::DeviceMissing);
+                                    }
+                                    _ => state.defer_detile(target.format, buffer_size),
+                                }
+                            }
+                        }
+                    }
+                }
+                #[cfg(feature = "backend_vulkan")]
                 if !copy_rects.is_empty() {
                     if let Some(state) = target.transfer.as_deref_mut() {
                         'transfer: {
@@ -2054,7 +2203,7 @@ where
                             let Some(modifiers) = modifiers else {
                                 break 'transfer;
                             };
-                            if !modifiers.contains(&target.source.format().modifier) {
+                            if !modifiers.contains(&input.dmabuf.format().modifier) {
                                 // Initialization finished after rendering began. Keep this
                                 // frame on the CPU path; the next render negotiates storage.
                                 break 'transfer;
@@ -2082,22 +2231,26 @@ where
                                             && destination_modifiers.contains(&destination.format().modifier)
                                             && destination.num_planes() == 1
                                             && destination.size() == buffer_size
-                                            && destination.format().code == target.source.format().code
-                                            && destination.y_inverted() == target.source.y_inverted()
+                                            && destination.format().code == input.dmabuf.format().code
+                                            && destination.y_inverted() == input.dmabuf.y_inverted()
                                             && !state.direct_target_rejected(destination);
                                         if eligible {
-                                            match state.engine(copy_node).unwrap().copy(
-                                                &target.source,
-                                                destination,
-                                                &sync,
-                                                Some(&external.acquire),
-                                                &direct_damage,
-                                            ) {
+                                            let copy_result = {
+                                                let _timing = timing::time(timing::Stage::TargetCopy);
+                                                state.engine(copy_node).unwrap().copy(
+                                                    &input.dmabuf,
+                                                    destination,
+                                                    &input.acquire,
+                                                    Some(&external.acquire),
+                                                    &direct_damage,
+                                                )
+                                            };
+                                            match copy_result {
                                                 Ok(copy_sync) => {
                                                     // Store ownership immediately: even a subsequent
                                                     // target wait/cleanup failure must retire this copy.
                                                     timing::count(timing::Counter::DirectCopies, 1);
-                                                    state.source_release = copy_sync.clone();
+                                                    input.publish_reader(state, copy_sync.clone());
                                                     debug!(
                                                         source = ?self.node,
                                                         target = ?target.device.node(),
@@ -2181,12 +2334,25 @@ where
                             }
                             // A direct rejection does not poison transport. Prefer the
                             // working shared GLES reader over allocating an intermediate.
-                            if target.texture.is_some() {
+                            if input.detiled {
+                                // Import the actual L payload only on fallback, not on the
+                                // successful direct fast path. Never alias S's cached texture.
+                                detile_texture = target
+                                    .device
+                                    .renderer_mut()
+                                    .import_dmabuf(&input.dmabuf, Some(&exact_damage))
+                                    .ok();
+                            }
+                            if if input.detiled {
+                                detile_texture.is_some()
+                            } else {
+                                target.texture.is_some()
+                            } {
                                 break 'transfer;
                             }
                             // Invalid is never an eligible destination layout; reserve it
                             // as a whole-attempt cooldown after exhausting all candidates.
-                            if !state.intermediate_allowed(&target.source, Modifier::Invalid) {
+                            if !state.intermediate_allowed(&input.dmabuf, Modifier::Invalid) {
                                 break 'transfer;
                             }
                             let sample_formats = target.device.renderer().dmabuf_formats();
@@ -2221,7 +2387,7 @@ where
                             }
                             let mut prepared = None;
                             for modifier in destination_modifiers {
-                                if !state.intermediate_allowed(&target.source, modifier) {
+                                if !state.intermediate_allowed(&input.dmabuf, modifier) {
                                     continue;
                                 }
                                 let cached = state
@@ -2249,7 +2415,7 @@ where
                                         }
                                         Ok(_) => {
                                             warn!("allocator returned incompatible Vulkan destination");
-                                            state.defer_intermediate(&target.source, modifier, true);
+                                            state.defer_intermediate(&input.dmabuf, modifier, true);
                                             continue;
                                         }
                                         Err(err) => {
@@ -2258,7 +2424,7 @@ where
                                                 ?err,
                                                 "Vulkan destination layout allocation failed"
                                             );
-                                            state.defer_intermediate(&target.source, modifier, false);
+                                            state.defer_intermediate(&input.dmabuf, modifier, false);
                                             continue;
                                         }
                                     }
@@ -2286,23 +2452,27 @@ where
                                             ?err,
                                             "Vulkan target import failed; trying another layout"
                                         );
-                                        state.defer_intermediate(&target.source, modifier, false);
+                                        state.defer_intermediate(&input.dmabuf, modifier, false);
                                         state.discard_destination();
                                     }
                                 }
                             }
                             let Some((destination, texture)) = prepared else {
-                                state.defer_intermediate(&target.source, Modifier::Invalid, false);
+                                state.defer_intermediate(&input.dmabuf, Modifier::Invalid, false);
                                 break 'transfer;
                             };
                             let destination_release = state.destination_release.clone();
-                            let copy_sync = match state.engine(copy_node).unwrap().copy(
-                                &target.source,
-                                &destination,
-                                &sync,
-                                Some(&destination_release),
-                                &copy_rects,
-                            ) {
+                            let copy_result = {
+                                let _timing = timing::time(timing::Stage::TargetCopy);
+                                state.engine(copy_node).unwrap().copy(
+                                    &input.dmabuf,
+                                    &destination,
+                                    &input.acquire,
+                                    Some(&destination_release),
+                                    if input.detiled { &exact_damage } else { &copy_rects },
+                                )
+                            };
+                            let copy_sync = match copy_result {
                                 Ok(copy_sync) => copy_sync,
                                 Err(err) => {
                                     if err.is_device_lost() {
@@ -2313,7 +2483,7 @@ where
                                     }
                                     debug!(?err, "Vulkan transfer failed before submission; using CPU copy");
                                     state.defer_intermediate(
-                                        &target.source,
+                                        &input.dmabuf,
                                         destination.format().modifier,
                                         transfer::cache_direct_rejection(&err),
                                     );
@@ -2323,7 +2493,7 @@ where
                             };
                             debug!(source = ?self.node, target = ?target.device.node(), native_fence = copy_sync.is_exportable(), "submitted same-frame Vulkan transfer");
                             timing::count(timing::Counter::IntermediateCopies, 1);
-                            state.source_release = copy_sync.clone();
+                            input.publish_reader(state, copy_sync.clone());
                             let result = (|| {
                                 let mut frame = target
                                     .device
@@ -2380,7 +2550,23 @@ where
                 // The texture always belongs to this frame's actual source allocation.
                 // Explicit target-copy preference may try Vulkan first, but never removes
                 // this working GPU fallback when the direct destination is unsupported.
-                if let Some(texture) = target.texture.as_ref() {
+                #[cfg(feature = "backend_vulkan")]
+                if input.detiled && detile_texture.is_none() {
+                    detile_texture = target
+                        .device
+                        .renderer_mut()
+                        .import_dmabuf(&input.dmabuf, Some(&exact_damage))
+                        .ok();
+                }
+                #[cfg(feature = "backend_vulkan")]
+                let shared_texture = if input.detiled {
+                    detile_texture.as_ref()
+                } else {
+                    target.texture.as_ref()
+                };
+                #[cfg(not(feature = "backend_vulkan"))]
+                let shared_texture = target.texture.as_ref();
+                if let Some(texture) = shared_texture {
                     if damage.is_empty() {
                         render
                             .renderer_mut()
@@ -2399,7 +2585,11 @@ where
                         .render(target.framebuffer, self.size, Transform::Normal)
                         .map_err(Error::Target)?;
                     let draw_result = (|| {
-                        frame.wait(&sync).map_err(Error::Target)?;
+                        #[cfg(feature = "backend_vulkan")]
+                        let acquire = &input.acquire;
+                        #[cfg(not(feature = "backend_vulkan"))]
+                        let acquire = &sync;
+                        frame.wait(acquire).map_err(Error::Target)?;
                         frame
                             .clear(Color32F::TRANSPARENT, &damage)
                             .map_err(Error::Target)?;
@@ -2419,7 +2609,7 @@ where
                     #[cfg(feature = "backend_vulkan")]
                     if let Some(state) = target.transfer.as_deref_mut() {
                         match &finished {
-                            Ok(sync) => state.source_release = sync.clone(),
+                            Ok(sync) => input.publish_reader(state, sync.clone()),
                             // No trustworthy reader fence: do not permit source reuse.
                             Err(_) => state.device_lost = true,
                         }
@@ -2433,6 +2623,12 @@ where
                     return Ok(sync);
                 }
 
+                // A successful detile acquired exclusive FOREIGN ownership of S.
+                // CPU readback uses the original framebuffer, so retire f1 first.
+                #[cfg(feature = "backend_vulkan")]
+                if input.detiled {
+                    transfer::wait(&input.acquire);
+                }
                 timing::count(timing::Counter::CpuCopies, u64::from(!copy_rects.is_empty()));
                 let mut mappings = Vec::new();
                 for rect in copy_rects {

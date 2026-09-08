@@ -28,6 +28,73 @@ enum Engine {
 
 const CACHE_LIMIT: usize = 8;
 
+/// Two independently node-bound slots; VkBridge bounds resources to eight per
+/// engine, hence a fixed sixteen-resource budget for a two-leg pair.
+#[derive(Debug, Default)]
+struct EngineSlot {
+    engine: Engine,
+    node: Option<DrmNode>,
+    source_caps: Cache<(Fourcc, i32, i32), Vec<Modifier>>,
+    destination_caps: Cache<(Fourcc, i32, i32), Vec<Modifier>>,
+}
+
+impl EngineSlot {
+    fn initialization_pending(&self) -> bool {
+        matches!(self.engine, Engine::Initializing(_))
+    }
+
+    fn engine(&mut self, node: DrmNode, device_lost: &mut bool) -> Option<&mut VkBridge> {
+        debug_assert!(self.node.is_none_or(|old| old == node));
+        self.node = Some(node);
+        if *device_lost {
+            return None;
+        }
+        if matches!(self.engine, Engine::Uninitialized) {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            match std::thread::Builder::new()
+                .name("vktransfer-init".into())
+                .spawn(move || {
+                    let _ = sender.send(VkBridge::new(node));
+                }) {
+                Ok(_) => self.engine = Engine::Initializing(receiver),
+                Err(err) => {
+                    warn!("failed to spawn Vulkan transfer initialization: {err}");
+                    self.engine = Engine::Failed;
+                }
+            }
+        }
+        if let Engine::Initializing(receiver) = &self.engine {
+            match receiver.try_recv() {
+                Ok(Ok(engine)) => self.engine = Engine::Ready(engine),
+                Ok(Err(err)) => {
+                    *device_lost |= err.is_device_lost();
+                    warn!("Vulkan transfer initialization failed: {err}");
+                    self.engine = Engine::Failed;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.engine = Engine::Failed,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        match &mut self.engine {
+            Engine::Ready(engine) => Some(engine),
+            _ => None,
+        }
+    }
+}
+
+/// The payload and its reader-release role travel together through both legs.
+pub(super) struct PreparedTransferInput {
+    pub dmabuf: Dmabuf,
+    pub acquire: SyncPoint,
+    pub detiled: bool,
+}
+
+impl PreparedTransferInput {
+    pub fn publish_reader(&self, state: &mut TransferState, fence: SyncPoint) {
+        state.record_reader(self.detiled, fence);
+    }
+}
+
 /// Small bounded LRU for capability results and retry throttling, including negatives.
 #[derive(Debug)]
 struct Cache<K, V>(std::collections::VecDeque<(K, V)>);
@@ -79,15 +146,19 @@ type IntermediateKey = (Fourcc, i32, i32, Modifier, Modifier);
 /// dependency of the next write. No ring-size or output-timing assumption is made.
 #[derive(Debug, Default)]
 pub(super) struct TransferState {
-    engine: Engine,
+    target_engine: EngineSlot,
+    detile_engine: EngineSlot,
+    pub source_detile_enabled: bool,
+    pub linear: Option<Dmabuf>,
+    pub linear_release: SyncPoint,
     pub source_generation: Option<std::sync::Arc<()>>,
     pub device_lost: bool,
     pub direct_target_enabled: bool,
     pub copy_device: super::VulkanCopyDevice,
     copy_node: Option<DrmNode>,
-    source_caps: Cache<(Fourcc, i32, i32), Vec<Modifier>>,
-    destination_caps: Cache<(Fourcc, i32, i32), Vec<Modifier>>,
     intermediate_retries: Cache<IntermediateKey, std::time::Instant>,
+    detile_retries: Cache<(Fourcc, i32, i32), std::time::Instant>,
+    detile_route: Option<(Fourcc, i32, i32)>,
     rejected_direct_targets: HashSet<WeakDmabuf>,
     source: Option<Dmabuf>,
     pub destination: Option<Dmabuf>,
@@ -107,7 +178,9 @@ impl TransferState {
         let generation = self.source_generation.clone();
         let direct_target_enabled = self.direct_target_enabled;
         let copy_device = self.copy_device;
+        let source_detile_enabled = self.source_detile_enabled;
         *self = Self::default();
+        self.source_detile_enabled = source_detile_enabled;
         self.source_generation = generation;
         self.direct_target_enabled = direct_target_enabled;
         self.copy_device = copy_device;
@@ -137,42 +210,117 @@ impl TransferState {
             self.invalidate();
             self.copy_node = Some(node);
         }
-        if self.device_lost {
-            return None;
+        self.target_engine.engine(node, &mut self.device_lost)
+    }
+
+    /// Only an in-flight optional initialization delays baseline target caps.
+    /// Failed initialization preserves the target engine's working single-copy route.
+    pub fn detile_initialization_pending(&self) -> bool {
+        self.detile_engine.initialization_pending()
+    }
+
+    pub fn detile_active(&self) -> bool {
+        self.source_detile_enabled && self.prefers_direct()
+    }
+
+    pub fn detile_engine(&mut self, node: DrmNode) -> Option<&mut VkBridge> {
+        if self.detile_engine.node.is_some_and(|old| old != node) {
+            self.invalidate();
         }
-        if matches!(self.engine, Engine::Uninitialized) {
-            let (sender, receiver) = std::sync::mpsc::channel();
-            match std::thread::Builder::new()
-                .name("vktransfer-init".into())
-                .spawn(move || {
-                    let _ = sender.send(VkBridge::new(node));
-                }) {
-                Ok(_) => self.engine = Engine::Initializing(receiver),
+        self.detile_engine.engine(node, &mut self.device_lost)
+    }
+
+    /// Poll both engines before advertising a native source layout. Target caps
+    /// always come from the target slot; Intel only supplies the first leg.
+    pub fn render_modifiers(
+        &mut self,
+        render: DrmNode,
+        target: DrmNode,
+        format: Fourcc,
+        size: Size<i32, Buffer>,
+    ) -> Option<Vec<Modifier>> {
+        self.detile_route = None;
+        let node = self.copy_node(render, target);
+        let baseline = self.source_modifiers(node, format, size);
+        if !self.detile_active() {
+            return baseline;
+        }
+        let ready = self.detile_engine(render).is_some();
+        if !ready || baseline.is_none() {
+            return baseline;
+        }
+        let key = (format, size.w, size.h);
+        if self
+            .detile_retries
+            .get(&key)
+            .is_some_and(|deadline| std::time::Instant::now() < deadline)
+        {
+            return baseline;
+        }
+        if self
+            .destination_modifiers(node, format, size)
+            .is_none_or(|caps| caps.is_empty())
+        {
+            return baseline;
+        }
+        let src = self.detile_engine.source_caps.get(&key);
+        let dst = self.detile_engine.destination_caps.get(&key);
+        let src = src.or_else(|| {
+            match self
+                .detile_engine(render)?
+                .source_modifiers(format, size.w as u32, size.h as u32)
+            {
+                Ok(caps) => {
+                    self.detile_engine.source_caps.insert(key, caps.clone());
+                    Some(caps)
+                }
                 Err(err) => {
-                    warn!("failed to spawn Vulkan transfer initialization: {err}");
-                    self.engine = Engine::Failed;
-                }
-            }
-        }
-        if let Engine::Initializing(receiver) = &self.engine {
-            match receiver.try_recv() {
-                Ok(Ok(engine)) => self.engine = Engine::Ready(engine),
-                Ok(Err(err)) => {
                     self.device_lost |= err.is_device_lost();
-                    warn!("Vulkan transfer initialization failed: {err}");
-                    self.engine = Engine::Failed;
+                    self.defer_detile(format, size);
+                    None
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    warn!("Vulkan transfer initialization disconnected");
-                    self.engine = Engine::Failed;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
+        });
+        let dst = dst.or_else(|| {
+            match self
+                .detile_engine(render)?
+                .destination_modifiers(format, size.w as u32, size.h as u32)
+            {
+                Ok(caps) => {
+                    self.detile_engine.destination_caps.insert(key, caps.clone());
+                    Some(caps)
+                }
+                Err(err) => {
+                    self.device_lost |= err.is_device_lost();
+                    self.defer_detile(format, size);
+                    None
+                }
+            }
+        });
+        if self.device_lost {
+            self.disable();
+            return Some(Vec::new());
         }
-        match &mut self.engine {
-            Engine::Ready(engine) => Some(engine),
-            _ => None,
+        if !baseline.as_ref().is_some_and(|m| m.contains(&Modifier::Linear))
+            || !dst.is_some_and(|m| m.contains(&Modifier::Linear))
+        {
+            return baseline;
         }
+        let native = src
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| *m != Modifier::Linear && *m != Modifier::Invalid)
+            .collect::<Vec<_>>();
+        if native.is_empty() {
+            baseline
+        } else {
+            self.detile_route = Some(key);
+            Some(native)
+        }
+    }
+
+    pub fn detile_route_ready(&self, format: Fourcc, size: Size<i32, Buffer>) -> bool {
+        self.detile_active() && self.detile_route == Some((format, size.w, size.h))
     }
 
     pub fn source_modifiers(
@@ -183,7 +331,7 @@ impl TransferState {
     ) -> Option<Vec<Modifier>> {
         self.engine(node)?;
         let key = (format, size.w, size.h);
-        if let Some(caps) = self.source_caps.get(&key) {
+        if let Some(caps) = self.target_engine.source_caps.get(&key) {
             return Some(caps);
         }
         let result = self
@@ -191,7 +339,7 @@ impl TransferState {
             .source_modifiers(format, size.w as u32, size.h as u32);
         match result {
             Ok(caps) => {
-                self.source_caps.insert(key, caps.clone());
+                self.target_engine.source_caps.insert(key, caps.clone());
                 Some(caps)
             }
             Err(err) => {
@@ -200,7 +348,7 @@ impl TransferState {
                 if self.device_lost {
                     self.disable();
                 } else if matches!(err, VkBridgeError::Unsupported(_)) {
-                    self.source_caps.insert(key, Vec::new());
+                    self.target_engine.source_caps.insert(key, Vec::new());
                 }
                 Some(Vec::new())
             }
@@ -222,10 +370,10 @@ impl TransferState {
         size: Size<i32, Buffer>,
     ) -> Option<Vec<Modifier>> {
         if self.engine(node).is_none() {
-            return matches!(self.engine, Engine::Failed).then(Vec::new);
+            return matches!(self.target_engine.engine, Engine::Failed).then(Vec::new);
         }
         let key = (format, size.w, size.h);
-        if let Some(caps) = self.destination_caps.get(&key) {
+        if let Some(caps) = self.target_engine.destination_caps.get(&key) {
             return Some(caps);
         }
         match self
@@ -233,7 +381,7 @@ impl TransferState {
             .destination_modifiers(format, size.w as u32, size.h as u32)
         {
             Ok(caps) => {
-                self.destination_caps.insert(key, caps.clone());
+                self.target_engine.destination_caps.insert(key, caps.clone());
                 Some(caps)
             }
             Err(err) => {
@@ -242,7 +390,7 @@ impl TransferState {
                 if self.device_lost {
                     self.disable();
                 } else if matches!(err, VkBridgeError::Unsupported(_)) {
-                    self.destination_caps.insert(key, Vec::new());
+                    self.target_engine.destination_caps.insert(key, Vec::new());
                 }
                 Some(Vec::new())
             }
@@ -292,7 +440,36 @@ impl TransferState {
 
     pub fn disable(&mut self) {
         self.retire_buffers();
-        self.engine = Engine::Failed;
+        self.target_engine.engine = Engine::Failed;
+        self.detile_engine.engine = Engine::Failed;
+    }
+
+    /// Format/extent-scoped retry, never a permanent engine disable. Eight entries
+    /// cover allocation, query and first-leg pre-submit failures without frame churn.
+    pub fn defer_detile(&mut self, format: Fourcc, size: Size<i32, Buffer>) {
+        self.detile_retries.insert(
+            (format, size.w, size.h),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+    }
+
+    pub fn discard_linear(&mut self) {
+        wait(&self.linear_release);
+        self.linear_release = SyncPoint::signaled();
+        self.linear = None;
+    }
+
+    fn record_reader(&mut self, detiled: bool, fence: SyncPoint) {
+        if detiled {
+            self.linear_release = fence;
+        } else {
+            self.source_release = fence;
+        }
+    }
+
+    pub fn record_detile(&mut self, fence: SyncPoint) {
+        self.source_release = fence.clone();
+        self.linear_release = fence;
     }
 
     fn retire_buffers(&mut self) {
@@ -301,6 +478,7 @@ impl TransferState {
         // A source copy fence and the downstream target-reader fence protect different
         // allocations; neither can stand in for the other.
         wait(&self.source_release);
+        self.discard_linear();
         wait(&self.destination_release);
         self.source_release = SyncPoint::signaled();
         self.destination_release = SyncPoint::signaled();
@@ -309,6 +487,36 @@ impl TransferState {
         self.rejected_direct_targets.clear();
         self.intermediate_retries.clear();
     }
+}
+
+/// A cold or size/format-changed source can use the same native S+L transaction
+/// immediately once the exact route is ready; it needs no baseline-only first frame.
+pub(super) fn source_allocation_needed(
+    modifiers: &[Modifier],
+    compatible_source: Option<Modifier>,
+    detile_ready: bool,
+    linear_compatible: bool,
+) -> bool {
+    match compatible_source {
+        Some(source) => source_migration_needed(modifiers, source, detile_ready, linear_compatible),
+        None => detile_ready && !modifiers.is_empty(),
+    }
+}
+
+/// A startup source may already have the native layout before either engine is
+/// ready. Once the exact route is negotiated, it still needs its transactional L.
+pub(super) fn source_migration_needed(
+    modifiers: &[Modifier],
+    source: Modifier,
+    detile_ready: bool,
+    linear_compatible: bool,
+) -> bool {
+    !modifiers.is_empty()
+        && (!modifiers.contains(&source)
+            || (detile_ready
+                && source != Modifier::Linear
+                && source != Modifier::Invalid
+                && !linear_compatible))
 }
 
 /// Prefer portable forward copies, but device-native reverse destinations.
@@ -595,11 +803,12 @@ mod tests {
         state.copy_device = VulkanCopyDevice::Target;
         assert!(state.prefers_direct());
         state
+            .target_engine
             .source_caps
             .insert((Fourcc::Xrgb8888, 1920, 1080), Vec::new());
         state.invalidate();
         assert!(state.prefers_direct());
-        assert!(state.source_caps.is_empty());
+        assert!(state.target_engine.source_caps.is_empty());
         state.direct_target_enabled = false;
         assert!(!state.prefers_direct());
     }
@@ -620,12 +829,28 @@ mod tests {
     fn source_rejection_cache_is_format_and_extent_scoped() {
         let mut state = TransferState::default();
         state
+            .target_engine
             .source_caps
             .insert((Fourcc::Xrgb8888, 1920, 1080), Vec::new());
-        assert!(state.source_caps.contains_key(&(Fourcc::Xrgb8888, 1920, 1080)));
-        assert!(!state.source_caps.contains_key(&(Fourcc::Xrgb2101010, 1920, 1080)));
-        assert!(!state.source_caps.contains_key(&(Fourcc::Xrgb8888, 1280, 720)));
-        assert!(matches!(state.engine, Engine::Uninitialized));
+        assert!(
+            state
+                .target_engine
+                .source_caps
+                .contains_key(&(Fourcc::Xrgb8888, 1920, 1080))
+        );
+        assert!(
+            !state
+                .target_engine
+                .source_caps
+                .contains_key(&(Fourcc::Xrgb2101010, 1920, 1080))
+        );
+        assert!(
+            !state
+                .target_engine
+                .source_caps
+                .contains_key(&(Fourcc::Xrgb8888, 1280, 720))
+        );
+        assert!(matches!(state.target_engine.engine, Engine::Uninitialized));
     }
 
     #[test]
@@ -668,7 +893,7 @@ mod tests {
             );
         }
         assert_eq!(state.intermediate_retries.0.len(), CACHE_LIMIT);
-        assert!(matches!(state.engine, Engine::Uninitialized));
+        assert!(matches!(state.target_engine.engine, Engine::Uninitialized));
         state.retire_buffers();
         assert!(state.intermediate_retries.is_empty());
     }
@@ -695,6 +920,240 @@ mod tests {
         assert!(state.destination_release.is_reached());
         drop(state);
         assert_eq!(*calls.lock().unwrap(), ["target", "target", "source"]);
+    }
+
+    #[test]
+    fn cold_and_mixed_size_sources_allocate_native_immediately_when_ready() {
+        let native = Modifier::from(72057594037927938u64);
+        // Missing source (including incompatible size/format) does not need a
+        // second render to upgrade from LINEAR after capability warmup.
+        assert!(source_allocation_needed(&[native], None, true, false));
+        let sizes = [(1920, 1080), (1280, 720), (960, 540), (1920, 1080)];
+        let mut current = None;
+        for size in sizes {
+            let compatible_source = (current == Some(size)).then_some(native);
+            assert!(source_allocation_needed(
+                &[native],
+                compatible_source,
+                true,
+                false
+            ));
+            current = Some(size);
+        }
+        assert!(!source_allocation_needed(&[native], Some(native), true, true));
+        // Warming, unavailable and disabled routes retain normal cold allocation.
+        assert!(!source_allocation_needed(&[native], None, false, false));
+        assert!(!source_allocation_needed(&[], None, true, false));
+        assert!(!source_allocation_needed(&[Modifier::Linear], None, false, false));
+    }
+
+    #[test]
+    fn startup_native_source_gets_linear_only_after_route_ready() {
+        let native = Modifier::from(72057594037927938u64);
+        // Already-native startup allocation must not hide the missing L after warmup.
+        assert!(!source_migration_needed(&[native], native, false, false));
+        assert!(source_migration_needed(&[native], native, true, false));
+        assert!(!source_migration_needed(&[native], native, true, true));
+        // Failed, warming and disabled routes cannot force an optional allocation.
+        assert!(!source_migration_needed(&[], native, true, false));
+        assert!(!source_migration_needed(
+            &[Modifier::Linear],
+            Modifier::Linear,
+            false,
+            false
+        ));
+        assert!(!source_migration_needed(
+            &[Modifier::Linear],
+            Modifier::Linear,
+            true,
+            false
+        ));
+        // Existing modifier migration remains unchanged for the single-copy route.
+        assert!(source_migration_needed(&[Modifier::Linear], native, false, false));
+    }
+
+    #[test]
+    fn detile_route_readiness_is_policy_format_extent_scoped() {
+        let mut state = TransferState::default();
+        let size = (1920, 1080).into();
+        state.source_detile_enabled = true;
+        state.direct_target_enabled = true;
+        state.copy_device = super::super::VulkanCopyDevice::Target;
+        assert!(!state.detile_route_ready(Fourcc::Xrgb8888, size));
+        state.detile_route = Some((Fourcc::Xrgb8888, 1920, 1080));
+        assert!(state.detile_route_ready(Fourcc::Xrgb8888, size));
+        assert!(!state.detile_route_ready(Fourcc::Xrgb2101010, size));
+        assert!(!state.detile_route_ready(Fourcc::Xrgb8888, (1280, 720).into()));
+        state.source_detile_enabled = false;
+        assert!(!state.detile_route_ready(Fourcc::Xrgb8888, size));
+        state.source_detile_enabled = true;
+        state.invalidate();
+        assert!(!state.detile_route_ready(Fourcc::Xrgb8888, size));
+    }
+
+    #[test]
+    fn optional_engine_failure_preserves_baseline_cap_availability() {
+        let mut state = TransferState::default();
+        let baseline = Some(vec![Modifier::Linear]);
+        let visible_caps = |state: &TransferState| {
+            if state.detile_initialization_pending() {
+                None
+            } else {
+                baseline.clone()
+            }
+        };
+        assert_eq!(visible_caps(&state), baseline);
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        state.detile_engine.engine = Engine::Initializing(receiver);
+        assert_eq!(visible_caps(&state), None);
+        // Recoverable optional initialization failure must not masquerade as
+        // pending forever and hide already negotiated target-engine layouts.
+        state.detile_engine.engine = Engine::Failed;
+        assert_eq!(visible_caps(&state), baseline);
+        assert!(!state.device_lost);
+        // A lost device remains a separate fatal condition checked by the API.
+        state.device_lost = true;
+        assert!(state.device_lost);
+        assert!(!state.detile_initialization_pending());
+    }
+
+    #[test]
+    fn detile_policy_is_opt_in_target_direct_and_survives_invalidation() {
+        use super::super::VulkanCopyDevice;
+        let mut state = TransferState::default();
+        assert!(!state.source_detile_enabled);
+        for enabled in [false, true] {
+            for direct in [false, true] {
+                for role in [VulkanCopyDevice::Render, VulkanCopyDevice::Target] {
+                    state.source_detile_enabled = enabled;
+                    state.direct_target_enabled = direct;
+                    state.copy_device = role;
+                    let active = enabled && direct && role == VulkanCopyDevice::Target;
+                    assert_eq!(state.detile_active(), active);
+                    state.invalidate();
+                    assert_eq!(state.detile_active(), active);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn engine_capability_roles_are_independent_and_epoch_retired() {
+        let mut state = TransferState::default();
+        let key = (Fourcc::Xrgb8888, 1920, 1080);
+        state
+            .detile_engine
+            .source_caps
+            .insert(key, vec![Modifier::Invalid]);
+        state
+            .detile_engine
+            .destination_caps
+            .insert(key, vec![Modifier::Linear]);
+        state.target_engine.source_caps.insert(key, vec![]);
+        assert_eq!(state.target_engine.source_caps.get(&key), Some(vec![]));
+        assert_eq!(
+            state.detile_engine.destination_caps.get(&key),
+            Some(vec![Modifier::Linear])
+        );
+        assert!(
+            state
+                .detile_engine
+                .source_caps
+                .get(&(Fourcc::Xrgb2101010, 1920, 1080))
+                .is_none()
+        );
+        assert!(
+            state
+                .detile_engine
+                .source_caps
+                .get(&(Fourcc::Xrgb8888, 1280, 720))
+                .is_none()
+        );
+        state.invalidate();
+        assert!(state.detile_engine.source_caps.is_empty());
+        assert!(state.detile_engine.destination_caps.is_empty());
+        assert!(state.target_engine.source_caps.is_empty());
+    }
+
+    #[test]
+    fn detile_fence_ledger_failure_success_readers_and_retirement() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let fence = |name| {
+            SyncPoint::from(TrackingFence {
+                name,
+                calls: calls.clone(),
+                interrupt: AtomicBool::new(false),
+            })
+        };
+        let mut state = TransferState::default();
+        // Pre-submit failure changes no owner.
+        assert!(!state.source_release.contains_fence());
+        assert!(!state.linear_release.contains_fence());
+        state.record_detile(fence("f1"));
+        // Stage two pre-submit failure leaves BOTH f1 owners intact.
+        assert_eq!(state.source_release.get::<TrackingFence>().unwrap().name, "f1");
+        assert_eq!(state.linear_release.get::<TrackingFence>().unwrap().name, "f1");
+        state.record_reader(true, fence("f2"));
+        assert_eq!(state.source_release.get::<TrackingFence>().unwrap().name, "f1");
+        assert_eq!(state.linear_release.get::<TrackingFence>().unwrap().name, "f2");
+        // A GLES reader of L replaces only L's release; D has its own reader.
+        state.record_reader(true, fence("linear-gles"));
+        state.destination_release = fence("destination-gles");
+        state.retire_buffers();
+        assert_eq!(*calls.lock().unwrap(), ["f1", "linear-gles", "destination-gles"]);
+        drop(state);
+        assert_eq!(calls.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn failed_second_leg_retirement_keeps_both_submitted_owners() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut state = TransferState::default();
+        state.record_detile(SyncPoint::from(TrackingFence {
+            name: "f1",
+            calls: calls.clone(),
+            interrupt: AtomicBool::new(false),
+        }));
+        state.retire_buffers();
+        assert_eq!(*calls.lock().unwrap(), ["f1", "f1"]);
+        assert!(!state.source_release.contains_fence());
+        assert!(!state.linear_release.contains_fence());
+    }
+
+    #[test]
+    fn detile_retry_is_bounded_and_format_extent_scoped() {
+        let mut state = TransferState::default();
+        state.defer_detile(Fourcc::Xrgb8888, (1920, 1080).into());
+        assert!(state.detile_retries.contains_key(&(Fourcc::Xrgb8888, 1920, 1080)));
+        assert!(
+            !state
+                .detile_retries
+                .contains_key(&(Fourcc::Xrgb2101010, 1920, 1080))
+        );
+        assert!(!state.detile_retries.contains_key(&(Fourcc::Xrgb8888, 1280, 720)));
+        for width in 1..32 {
+            state.defer_detile(Fourcc::Xrgb8888, (width, 1080).into());
+        }
+        assert_eq!(state.detile_retries.0.len(), CACHE_LIMIT);
+        state.invalidate();
+        assert!(state.detile_retries.is_empty());
+    }
+
+    #[test]
+    fn linear_discard_does_not_retire_other_roles() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut state = TransferState::default();
+        state.record_detile(SyncPoint::from(TrackingFence {
+            name: "f1",
+            calls: calls.clone(),
+            interrupt: AtomicBool::new(true),
+        }));
+        state.discard_linear();
+        assert_eq!(*calls.lock().unwrap(), ["f1", "f1"]);
+        assert!(state.source_release.contains_fence());
+        assert!(!state.linear_release.contains_fence());
+        state.retire_buffers();
+        assert_eq!(*calls.lock().unwrap(), ["f1", "f1", "f1"]);
     }
 
     #[test]

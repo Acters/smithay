@@ -342,3 +342,32 @@ regressions passed. Ordinary shared-GLES fallback and NVIDIA->Intel tests also p
 Niri's `docs/intel-nvidia-bridge.md` records the setup. Real NVIDIA KMS transition,
 copy-fence presentation, pacing and idle-power behavior are separate live gates;
 source-side Intel rendering into LINEAR is not assumed optimal for every workload.
+
+## Optional source detile leg
+
+`set_vulkan_source_detile_enabled(true)` opts into a second, source-side pooled
+engine only for Target+direct policy. Native single-plane source layouts are
+negotiated with source GLES/Intel Vulkan; source-owned LINEAR must be supported as
+Intel TRANSFER_DST and NVIDIA TRANSFER_SRC. Target native capabilities remain on
+the target engine. Both engines initialize independently in the background; failed
+optional source initialization preserves baseline target capabilities, not endless
+pending status. Pools remain eight sets per engine, with bounded capability/retry
+storage and source-manager-stamped policy epochs.
+
+Native S and LINEAR L are allocated/validated transactionally, including cold and
+mixed-size requests once the route is ready. Intel S->L completion f1 is immediately
+stored as source_release and linear_release. NVIDIA L->target completion f2 replaces
+only linear_release; source can be rendered again after f1. Actual L is used for
+shared-GLES fallback with its reader fence, and original-S CPU fallback waits f1
+before touching memory whose ownership was transferred to Vulkan. S/L/D releases
+are separately retired on invalidation/replacement. KMS lease and external-write
+finish rules remain unchanged.
+
+Repeated full-redraw, serialized render-start-to-final-fence 1080p proxies improved
+from ~7.7–7.8ms single-copy LINEAR to ~6.1ms native tiled + two copies in both formats.
+This is four-clear layout/bandwidth evidence, not GPU execution or desktop pacing.
+Small/full-HD native MultiRenderer tests pass exact sparse damage, shared readers,
+capture/blits, three mixed targets and invalidation; strict counters prove both
+legs for every non-GLES measured draw. Existing single-copy routes remain tested.
+Live adoption/performance is a separate gate recorded by niri's
+`docs/intel-tiled-reverse-plan.md`.

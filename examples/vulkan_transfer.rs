@@ -149,12 +149,32 @@ struct Args {
     /// Stress pooled fences/reuse; requires --frames >=64 and SMITHAY_FRAME_TIMING=1.
     #[arg(long, conflicts_with_all = ["multigpu", "direct_target"])]
     pool_stress: bool,
+    /// Source-GPU Vulkan tiled-to-LINEAR stage before the target-GPU Vulkan copy.
+    #[arg(long, requires = "native_target", conflicts_with = "pool_stress")]
+    source_detile: bool,
+    /// Offline serialized wall-latency proxy, NOT physical pacing or GPU execution time.
+    #[arg(long, conflicts_with = "multigpu")]
+    measure_latency: bool,
+    /// Redraw all quadrants and transfer the full frame on every direct-engine iteration.
+    #[arg(long, conflicts_with = "multigpu")]
+    full_damage: bool,
 }
 
 impl Args {
     fn validate_modes(&self) -> ProbeResult<()> {
         if self.native_target && self.multigpu && !self.direct_target {
             return Err("--native-target with --multigpu requires --direct-target".into());
+        }
+        if self.source_detile
+            && (!self.native_target
+                || (self.multigpu && !self.direct_target)
+                || self.pool_stress
+                || self.copy_node.as_deref() != Some(self.target.as_path()))
+        {
+            return Err("--source-detile requires --native-target --copy-node=<target> and, with --multigpu, --direct-target; --pool-stress is not supported with two engines".into());
+        }
+        if self.multigpu && (self.measure_latency || self.full_damage) {
+            return Err("--measure-latency and --full-damage require direct-engine mode".into());
         }
         Ok(())
     }
@@ -351,12 +371,14 @@ where
 struct RetireFences {
     producer: SyncPoint,
     copy: SyncPoint,
+    // Separate first-leg retirement: stage two can fail after stage one is submitted.
+    detile: SyncPoint,
     reader: SyncPoint,
 }
 
 impl Drop for RetireFences {
     fn drop(&mut self) {
-        for fence in [&self.producer, &self.copy, &self.reader] {
+        for fence in [&self.producer, &self.detile, &self.copy, &self.reader] {
             while fence.wait().is_err() {
                 std::thread::yield_now();
             }
@@ -651,8 +673,57 @@ impl Drop for PoolStress {
     }
 }
 
+// Drain only outside the timed endpoint. These are resource-set counters, not logical
+// fence batches or GBM/import allocations. No worker is needed for this serialized proof.
+fn resource_snapshot() -> [u64; 6] {
+    let counters = [
+        Counter::ResourceSetsCreated,
+        Counter::ResourceSetsReused,
+        Counter::ResourceSetsRecycled,
+        Counter::ResourceSetsDestroyed,
+        Counter::ResourcePoolBusy,
+        Counter::SignalSemaphoresReplaced,
+    ];
+    let mut delta = [0; 6];
+    for snapshot in timing::drain() {
+        for (counter, value) in snapshot.counters {
+            if let Some(index) = counters.iter().position(|&c| c == counter) {
+                delta[index] += value;
+            }
+        }
+    }
+    delta
+}
+
+fn print_latency(
+    samples: &mut [Duration],
+    w: i32,
+    h: i32,
+    src: &Dmabuf,
+    linear: Option<&Dmabuf>,
+    dst: &Dmabuf,
+) {
+    samples.sort_unstable();
+    let count = samples.len();
+    // Nearest-rank quantiles over exact monotonic wall samples, not histogram buckets.
+    let percentile = |p: usize| samples[(count * p).div_ceil(100).saturating_sub(1)].as_secs_f64() * 1e6;
+    let mean = samples.iter().map(Duration::as_secs_f64).sum::<f64>() * 1e6 / count as f64;
+    println!(
+        "LATENCY serialized_proxy NOT_physical_frame_pacing NOT_GPU_execution size={w}x{h} warmup_discard=16 count={count} mean_us={mean:.3} p50_us={:.3} p95_us={:.3} p99_us={:.3} max_us={:.3} source_modifier={} intermediate_modifier={:?} target_modifier={} endpoint=source_render_start_to_final_VkFence_wait readback_excluded=true",
+        percentile(50),
+        percentile(95),
+        percentile(99),
+        samples[count - 1].as_secs_f64() * 1e6,
+        u64::from(src.format().modifier),
+        linear.map(|buf| u64::from(buf.format().modifier)),
+        u64::from(dst.format().modifier),
+    );
+}
+
 fn run_size(
     bridge: &mut VkBridge,
+    mut source_bridge: Option<&mut VkBridge>,
+    resource_totals: &mut [u64; 6],
     source: &mut Gpu,
     target: &mut Gpu,
     args: &Args,
@@ -667,7 +738,11 @@ fn run_size(
         .filter(|f| f.code == format && f.modifier != Modifier::Invalid)
         .map(|f| f.modifier)
         .collect();
-    let transfer_modifiers = bridge.source_modifiers(format, w as u32, h as u32)?;
+    let transfer_modifiers = if let Some(detile) = source_bridge.as_deref_mut() {
+        detile.source_modifiers(format, w as u32, h as u32)?
+    } else {
+        bridge.source_modifiers(format, w as u32, h as u32)?
+    };
     modifiers.retain(|modifier| transfer_modifiers.contains(modifier));
     modifiers.sort_by_key(|&m| (m == Modifier::Linear, u64::from(m)));
     modifiers.dedup();
@@ -715,6 +790,40 @@ fn run_size(
         }
         vec![Modifier::Linear]
     };
+    // The intermediate is source-owned, explicit LINEAR, and never sampled by GLES.
+    // Query both exact transfer roles; EGL texture support is deliberately irrelevant.
+    let linear_bo = if let Some(detile) = source_bridge.as_deref_mut() {
+        let intel_dst = detile.destination_modifiers(format, w as u32, h as u32)?;
+        let target_src = bridge.source_modifiers(format, w as u32, h as u32)?;
+        if !intel_dst.contains(&Modifier::Linear) || !target_src.contains(&Modifier::Linear) {
+            return Err("source-detile: no shared explicit LINEAR source-Vulkan TRANSFER_DST / target-Vulkan TRANSFER_SRC capability".into());
+        }
+        Some(
+            source
+                .allocator
+                .create_buffer(w as u32, h as u32, format, &[Modifier::Linear])?,
+        )
+    } else {
+        None
+    };
+    let linear = linear_bo.as_ref().map(|bo| bo.export()).transpose()?;
+    if let Some(linear) = &linear {
+        if linear.format().code != format
+            || linear.format().modifier != Modifier::Linear
+            || linear.size() != (w, h).into()
+        {
+            return Err(
+                "source-detile: GBM intermediate differs from negotiated format/extent/explicit LINEAR"
+                    .into(),
+            );
+        }
+        println!(
+            "ALLOC intermediate size={w}x{h} owner=source format={:?} modifier={} planes={}",
+            linear.format().code,
+            u64::from(linear.format().modifier),
+            linear.num_planes()
+        );
+    }
     let source_bo = source
         .allocator
         .create_buffer(w as u32, h as u32, format, &modifiers)?;
@@ -742,7 +851,12 @@ fn run_size(
     };
     let mut src = source_bo.export()?;
     let dst = destination_bo.export()?;
-    if !modifiers.contains(&src.format().modifier) || !destination_modifiers.contains(&dst.format().modifier)
+    if src.format().code != format
+        || dst.format().code != format
+        || src.size() != (w, h).into()
+        || dst.size() != (w, h).into()
+        || !modifiers.contains(&src.format().modifier)
+        || !destination_modifiers.contains(&dst.format().modifier)
     {
         return Err(format!(
             "GBM returned modifiers outside negotiated sets: source={:?}, destination={:?}",
@@ -770,35 +884,93 @@ fn run_size(
     let mut previous_colors = colors;
     let mut source_release = SyncPoint::signaled();
     let mut target_release: Option<SyncPoint> = None;
+    let mut linear_release: Option<SyncPoint> = None;
+    // Declared after ALL three original BOs, dma-bufs and readback storage.
     let mut retire = RetireFences::default();
-    for sequence in 0..args.frames {
+    let iterations = args.frames + if args.measure_latency { 16 } else { 0 };
+    let mut samples = Vec::with_capacity(if args.measure_latency {
+        args.frames as usize
+    } else {
+        0
+    });
+    let resource_proof = (args.measure_latency || args.source_detile) && stress.is_none();
+    let mut steady_samples = 0;
+    for sequence in 0..iterations {
         if let Some(stress) = stress.as_deref_mut() {
             stress.check_old()?;
         }
+        if args.measure_latency {
+            // The preceding oracle's GPU reader is not part of this route's latency.
+            // Settle it outside the timer as well as excluding its CPU pixel comparison.
+            if let Some(reader) = &target_release {
+                reader.wait()?;
+            }
+        }
         // Server wait when native export is available; explicit CPU wait otherwise.
         source.renderer.wait(&source_release)?;
-        let update = if sequence == 0 {
+        let update = if sequence == 0 || args.full_damage {
             None
         } else {
             Some((sequence as usize - 1) % 4)
         };
-        if let Some(index) = update {
+        if args.full_damage && sequence != 0 {
+            // Change AND redraw every quadrant: identical real work on both routes.
+            for color in &mut colors {
+                *color = (*color + 1 + sequence as usize % 7) % COLORS.len();
+            }
+        } else if let Some(index) = update {
             colors[index] = (colors[index] + 1 + sequence as usize % 7) % COLORS.len();
         }
+        let render_started = args.measure_latency.then(Instant::now);
         let acquire = render_source(&mut source.renderer, &mut src, &rects, &colors, update)?;
         retire.producer = acquire.clone();
         let damage = update.map(|index| rects[index]).unwrap_or(full);
         let started = Instant::now();
-        let copy = bridge.copy(&src, &dst, &acquire, target_release.as_ref(), &[damage])?;
-        retire.copy = copy.clone();
+        let copy = if let (Some(detile), Some(linear)) = (source_bridge.as_deref_mut(), linear.as_ref()) {
+            let detiled = detile.copy(&src, linear, &acquire, linear_release.as_ref(), &[damage])?;
+            // Publish immediately, BEFORE the fallible second submit. On error, the
+            // intermediate remains owned and its outstanding writer is retired too.
+            retire.detile = detiled.clone();
+            source_release = detiled.clone();
+            linear_release = Some(detiled.clone());
+            let copied = bridge.copy(
+                linear,
+                &dst,
+                linear_release.as_ref().unwrap(),
+                target_release.as_ref(),
+                &[damage],
+            )?;
+            retire.copy = copied.clone();
+            linear_release = Some(copied.clone());
+            copied
+        } else {
+            let copied = bridge.copy(&src, &dst, &acquire, target_release.as_ref(), &[damage])?;
+            retire.copy = copied.clone();
+            copied
+        };
+        let submit_elapsed = started.elapsed();
+        if let Some(render_started) = render_started {
+            // Intentional offline serialization only. Stop the clock BEFORE any target
+            // GLES oracle or prior-frame CPU pixel comparison; never a pacing claim.
+            copy.wait()?;
+            let elapsed = render_started.elapsed();
+            if sequence >= 16 {
+                samples.push(elapsed);
+            }
+        }
         if let Some(stress) = stress.as_deref_mut() {
             stress.submitted(&copy)?;
         }
         println!(
-            "SUBMIT frame={sequence} damage={damage:?} elapsed_us={} producer_native={} copy_native={} complete_at_return={}",
-            started.elapsed().as_micros(),
+            "SUBMIT frame={sequence} damage={damage:?} elapsed_us={} producer_native={} copy_native={} {}={}",
+            submit_elapsed.as_micros(),
             acquire.is_exportable(),
             copy.is_exportable(),
+            if args.measure_latency {
+                "complete_after_latency_wait"
+            } else {
+                "complete_at_return"
+            },
             copy.is_reached()
         );
         // Old target read is still represented by its release when this copy is submitted.
@@ -820,7 +992,9 @@ fn run_size(
                 stress.check_old()?;
             }
         }
-        source_release = copy.clone();
+        if !args.source_detile {
+            source_release = copy.clone();
+        }
         target.renderer.wait(&copy)?;
         let texture = target.renderer.import_dmabuf(&dst, Some(&[damage]))?;
         let mut framebuffer = target.renderer.bind(&mut offscreen)?;
@@ -852,6 +1026,28 @@ fn run_size(
                 return Err(format!("pool resource churn after warmup: {delta:?}").into());
             }
         }
+        if resource_proof {
+            let delta = resource_snapshot();
+            for (total, value) in resource_totals.iter_mut().zip(delta) {
+                *total += value;
+            }
+            let bound = if args.source_detile { 16 } else { 8 };
+            if resource_totals[0] > bound
+                || resource_totals[3] != 0
+                || resource_totals[4] != 0
+                || resource_totals[5] != 0
+            {
+                return Err(
+                    format!("resource bound/churn failure: {resource_totals:?}, bound={bound}").into(),
+                );
+            }
+            if sequence >= 16 {
+                steady_samples += 1;
+                if delta[0] != 0 || delta[3] != 0 || delta[5] != 0 {
+                    return Err(format!("resource churn after 16-iteration warmup: {delta:?}").into());
+                }
+            }
+        }
     }
     verify(
         &mut target.renderer,
@@ -860,15 +1056,32 @@ fn run_size(
         h,
         &previous_colors,
         target_release.as_ref().unwrap(),
-        args.frames - 1,
+        iterations - 1,
     )?;
     source_release.wait()?;
+    if let Some(release) = &linear_release {
+        release.wait()?;
+    }
+    if args.measure_latency {
+        print_latency(&mut samples, w, h, &src, linear.as_ref(), &dst);
+    }
+    if resource_proof {
+        if resource_totals[0] == 0 {
+            return Err("resource proof recorded no creations (timing scope missing)".into());
+        }
+        println!(
+            "RESOURCE_SETS size={w}x{h} cumulative_created_reused_recycled_destroyed_busy_replaced={resource_totals:?} engines={} submits_this_size={} steady_iterations={steady_samples} zero_steady_churn_checked={} (resource sets only; no retained-old-fence pool-stress claim)",
+            if args.source_detile { 2 } else { 1 },
+            iterations * if args.source_detile { 2 } else { 1 },
+            steady_samples != 0
+        );
+    }
     if let Some(stress) = stress {
         stress.completed(&source_release)?;
         stress.check_old()?;
     }
-    // Both allocations are recreated on the next run_size call; the same engine keeps its
-    // bounded stable-identity cache. Original GBM BOs remain alive for this entire round.
+    // All allocations are recreated on the next run_size call; both engines (if present)
+    // keep their bounded stable-identity caches. Original GBM BOs outlive retirement.
     Ok(())
 }
 
@@ -1384,29 +1597,90 @@ fn native_multigpu_modifiers(
     Ok(modifiers)
 }
 
-fn assert_native_direct_route(sequence: u32) -> ProbeResult<()> {
+fn drain_direct_route() -> [u64; 4] {
     let mut direct = 0;
     let mut intermediate = 0;
     let mut cpu = 0;
+    let mut detile = 0;
     for snapshot in timing::drain() {
         for (counter, count) in snapshot.counters {
             match counter {
                 Counter::DirectCopies => direct += count,
+                Counter::DetileCopies => detile += count,
                 Counter::IntermediateCopies => intermediate += count,
                 Counter::CpuCopies => cpu += count,
                 _ => {}
             }
         }
     }
+    [direct, detile, intermediate, cpu]
+}
+
+fn assert_native_direct_route(sequence: u32, source_detile: bool) -> ProbeResult<()> {
+    let [direct, detile, intermediate, cpu] = drain_direct_route();
     let explicit_gles = sequence % 6 == 2;
-    if intermediate != 0 || cpu != 0 || (if explicit_gles { direct != 0 } else { direct == 0 }) {
+    let expected_detile = if source_detile { direct } else { 0 };
+    if intermediate != 0
+        || cpu != 0
+        || detile != expected_detile
+        || (if explicit_gles { direct != 0 } else { direct == 0 })
+    {
         return Err(format!(
-            "native MultiRenderer route proof failed: sequence={sequence} explicit_gles={explicit_gles} direct={direct} intermediate={intermediate} cpu={cpu}"
+            "native MultiRenderer route proof failed: sequence={sequence} explicit_gles={explicit_gles} source_detile={source_detile} direct={direct} detile={detile} intermediate={intermediate} cpu={cpu}"
         ).into());
     }
     println!(
-        "PASS ROUTE sequence={sequence} explicit_gles={explicit_gles} direct={direct} intermediate={intermediate} cpu={cpu}"
+        "PASS ROUTE sequence={sequence} explicit_gles={explicit_gles} source_detile={source_detile} direct={direct} detile={detile} intermediate={intermediate} cpu={cpu}"
     );
+    Ok(())
+}
+
+// A destination query may have warmed both engines, but only a successful two-leg
+// submission proves the source's actual native allocation is usable too. Bound startup
+// per output/size; fallback pixels never count as readiness. No measured-frame polling.
+fn warm_detile_targets(
+    manager: &mut MultiGpuManager,
+    source: &DrmNode,
+    target: &DrmNode,
+    format: Fourcc,
+    outputs: &mut [DirectOutput],
+    round: usize,
+) -> ProbeResult<()> {
+    for (index, output) in outputs.iter_mut().enumerate() {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut ready = false;
+        let mut last = String::from("no warmup submission");
+        for attempt in 0..200 {
+            let _ = timing::drain();
+            let result = draw_direct_output(manager, source, target, format, output, attempt, index, true);
+            let [direct, detile, intermediate, cpu] = drain_direct_route();
+            match result {
+                Ok(()) if direct > 0 && detile == direct && intermediate == 0 && cpu == 0 => {
+                    println!(
+                        "WARMUP TWO-LEG READY round={round} output={index} attempt={attempt} direct={direct} detile={detile}"
+                    );
+                    ready = true;
+                    break;
+                }
+                Ok(()) => {
+                    last = format!(
+                        "route not ready: direct={direct} detile={detile} intermediate={intermediate} cpu={cpu}"
+                    )
+                }
+                Err(err) => last = err.to_string(),
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if !ready {
+            return Err(format!(
+                "source-detile two-engine warmup failed round={round} output={index}: {last}"
+            )
+            .into());
+        }
+    }
     Ok(())
 }
 
@@ -1417,6 +1691,10 @@ fn run_direct_targets(
     args: &Args,
 ) -> ProbeResult<()> {
     manager.set_vulkan_direct_target_enabled(true);
+    // Opt in before modifier queries/warmups; copy policy was already selected as Target.
+    if args.source_detile {
+        manager.set_vulkan_source_detile_enabled(true);
+    }
     // Native MultiRenderer must prove the actual route, not just successful fallback pixels.
     // This standalone process owns its timing collector; the default probe remains unchanged.
     let _route_scope = if args.native_target {
@@ -1505,20 +1783,24 @@ fn run_direct_targets(
                 blit_release: None,
             });
         }
-        let mut successes = 0;
-        let mut last_error = None;
-        for attempt in 0..20 {
-            match draw_direct_output(manager, source, target, format, &mut outputs[0], attempt, 0, true) {
-                Ok(()) => successes += 1,
-                Err(err) => {
-                    eprintln!("WARMUP direct-target round={round} attempt={attempt}: {err}");
-                    last_error = Some(err);
+        if args.source_detile {
+            warm_detile_targets(manager, source, target, format, &mut outputs, round)?;
+        } else {
+            let mut successes = 0;
+            let mut last_error = None;
+            for attempt in 0..20 {
+                match draw_direct_output(manager, source, target, format, &mut outputs[0], attempt, 0, true) {
+                    Ok(()) => successes += 1,
+                    Err(err) => {
+                        eprintln!("WARMUP direct-target round={round} attempt={attempt}: {err}");
+                        last_error = Some(err);
+                    }
                 }
+                std::thread::sleep(Duration::from_millis(50));
             }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        if successes == 0 {
-            return Err(last_error.unwrap_or_else(|| "direct-target warmup failed".into()));
+            if successes == 0 {
+                return Err(last_error.unwrap_or_else(|| "direct-target warmup failed".into()));
+            }
         }
         {
             // Exercise retained-target drop order: after cache invalidation the bound
@@ -1558,7 +1840,7 @@ fn run_direct_targets(
                 }
                 draw_direct_output(manager, source, target, format, output, sequence, index, false)?;
                 if args.native_target {
-                    assert_native_direct_route(sequence)?;
+                    assert_native_direct_route(sequence, args.source_detile)?;
                 }
                 println!(
                     "SUBMIT direct-target round={round} output={index} sequence={sequence} exact_damage={:?} release_native={} complete_at_return={}",
@@ -1597,7 +1879,8 @@ fn run_direct_targets(
     }
     if args.native_target {
         println!(
-            "PASS NATIVE MULTIRENDERER ROUTE: direct Vulkan counters verified for every measured non-GLES draw across all sizes/cache invalidations; explicit target-GLES stages checked separately."
+            "PASS NATIVE MULTIRENDERER ROUTE: source_detile={} direct Vulkan counters verified for every measured non-GLES draw across all sizes/cache invalidations; enabled detile requires DetileCopies==DirectCopies>0, disabled detile requires zero; explicit target-GLES stages require both zero.",
+            args.source_detile
         );
     }
     println!(
@@ -1886,6 +2169,9 @@ fn main() -> ProbeResult<()> {
     if copy_node != source_node && copy_node != target_node {
         return Err("copy node must equal the source or target render node".into());
     }
+    if args.source_detile && copy_node != target_node {
+        return Err("--source-detile requires the main Vulkan copy engine on the target GPU".into());
+    }
     if args.multigpu {
         return run_multigpu(
             source_node,
@@ -1905,12 +2191,15 @@ fn main() -> ProbeResult<()> {
     );
     // One explicitly labelled pair on this recording thread; the worker intentionally
     // does not enter it (wait timing must not be confused with driver allocations).
-    let _timing_scope = if args.pool_stress {
+    if args.measure_latency || args.source_detile {
+        timing::set_enabled(true);
+    }
+    let _timing_scope = if args.pool_stress || args.measure_latency || args.source_detile {
         let stream = (1, 1);
         timing::register_stream(
             stream,
             &format!(
-                "pool-stress {} -> {}",
+                "direct-probe {} -> {}",
                 args.source.display(),
                 args.target.display()
             ),
@@ -1925,6 +2214,27 @@ fn main() -> ProbeResult<()> {
         None
     };
     let mut bridge = VkBridge::new(copy_node)?;
+    let mut source_bridge = if args.source_detile {
+        println!(
+            "INIT source-detile Vulkan source={} main_copy={} (capability failure is fatal; no CPU copy fallback)",
+            args.source.display(),
+            copy_path.display()
+        );
+        Some(
+            VkBridge::new(source_node)
+                .map_err(|err| format!("source-detile Vulkan initialization failed: {err}"))?,
+        )
+    } else {
+        None
+    };
+    let mut resource_totals = [0; 6];
+    println!(
+        "MODE source_detile={} measure_latency={} full_damage={} latency_warmup_per_size={}",
+        args.source_detile,
+        args.measure_latency,
+        args.full_damage,
+        if args.measure_latency { 16 } else { 0 }
+    );
     println!("INIT source GBM/EGL");
     let mut source = Gpu::new(source_file)?;
     println!("INIT target GBM/EGL");
@@ -1932,6 +2242,8 @@ fn main() -> ProbeResult<()> {
     for (w, h) in [(args.width, args.height), (args.width + 32, args.height + 24)] {
         run_size(
             &mut bridge,
+            source_bridge.as_mut(),
+            &mut resource_totals,
             &mut source,
             &mut target,
             &args,
@@ -1972,9 +2284,16 @@ fn main() -> ProbeResult<()> {
         );
     }
     println!(
-        "PASS Vulkan transfer probe: {:?}, {} frames, two sizes, reused buffers and partial damage",
+        "PASS Vulkan transfer probe: {:?}, {} frames (+{} latency warmup), two sizes, reused buffers, {} damage, source_detile={}",
         args.format,
-        args.frames * 2
+        args.frames * 2,
+        if args.measure_latency { 32 } else { 0 },
+        if args.full_damage {
+            "full-redraw"
+        } else {
+            "partial"
+        },
+        args.source_detile
     );
     Ok(())
 }

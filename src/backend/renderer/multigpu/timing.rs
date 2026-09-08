@@ -63,7 +63,7 @@ names! {
         BatchDestroy, TransferRetire, TransferWait, GlesFinish, TargetTextureImport,
         NiriRedraw, NiriCallbacks, NiriScreenCast, VulkanSignalSetup,
         QueueReturnLead, QueueReturnLate, NiriSceneUpdate, NiriVblank, NiriPresentRetire,
-        VulkanPoolReset
+        VulkanPoolReset, DetileCopy, TargetCopy
     }
 }
 names! {
@@ -77,7 +77,7 @@ names! {
         StreamRegistrations, QueueReturnedPastDeadline, FuturePresentationTimestamp,
         TransitionPresentationsIgnored, ResourceSetsCreated, ResourceSetsReused,
         ResourceSetsRecycled, ResourceSetsDestroyed, ResourcePoolBusy,
-        SignalSemaphoresReplaced, SequenceUnchanged
+        SignalSemaphoresReplaced, SequenceUnchanged, DetileCopies
     }
 }
 
