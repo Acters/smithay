@@ -2,7 +2,7 @@
 
 use crate::backend::{
     allocator::{
-        Fourcc, Modifier,
+        Buffer as _, Fourcc, Modifier,
         dmabuf::{Dmabuf, WeakDmabuf},
     },
     drm::DrmNode,
@@ -26,6 +26,53 @@ enum Engine {
     Failed,
 }
 
+const CACHE_LIMIT: usize = 8;
+
+/// Small bounded LRU for capability results and retry throttling, including negatives.
+#[derive(Debug)]
+struct Cache<K, V>(std::collections::VecDeque<(K, V)>);
+
+impl<K, V> Default for Cache<K, V> {
+    fn default() -> Self {
+        Self(std::collections::VecDeque::new())
+    }
+}
+
+impl<K: PartialEq, V: Clone> Cache<K, V> {
+    fn get(&mut self, key: &K) -> Option<V> {
+        let index = self.0.iter().position(|(entry, _)| entry == key)?;
+        let entry = self.0.remove(index).unwrap();
+        let value = entry.1.clone();
+        self.0.push_back(entry);
+        Some(value)
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        if let Some(index) = self.0.iter().position(|(entry, _)| entry == &key) {
+            self.0.remove(index);
+        } else if self.0.len() == CACHE_LIMIT {
+            self.0.pop_front();
+        }
+        self.0.push_back((key, value));
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, key: &K) -> bool {
+        self.0.iter().any(|(entry, _)| entry == key)
+    }
+}
+
+type IntermediateKey = (Fourcc, i32, i32, Modifier, Modifier);
+
 /// Resources shared by sequential transfers between one source/target device pair.
 ///
 /// A single destination suffices because its previous reader's fence is an explicit
@@ -36,6 +83,11 @@ pub(super) struct TransferState {
     pub source_generation: Option<std::sync::Arc<()>>,
     pub device_lost: bool,
     pub direct_target_enabled: bool,
+    pub copy_device: super::VulkanCopyDevice,
+    copy_node: Option<DrmNode>,
+    source_caps: Cache<(Fourcc, i32, i32), Vec<Modifier>>,
+    destination_caps: Cache<(Fourcc, i32, i32), Vec<Modifier>>,
+    intermediate_retries: Cache<IntermediateKey, std::time::Instant>,
     rejected_direct_targets: HashSet<WeakDmabuf>,
     source: Option<Dmabuf>,
     pub destination: Option<Dmabuf>,
@@ -54,9 +106,11 @@ impl TransferState {
     pub fn invalidate(&mut self) {
         let generation = self.source_generation.clone();
         let direct_target_enabled = self.direct_target_enabled;
+        let copy_device = self.copy_device;
         *self = Self::default();
         self.source_generation = generation;
         self.direct_target_enabled = direct_target_enabled;
+        self.copy_device = copy_device;
     }
 
     /// Cache rejection by allocation identity, without keeping a swapchain allocation alive.
@@ -79,6 +133,13 @@ impl TransferState {
 
     /// Keep the existing lazy initialization ordering, without async frame presentation.
     pub fn engine(&mut self, node: DrmNode) -> Option<&mut VkBridge> {
+        if self.copy_node != Some(node) {
+            self.invalidate();
+            self.copy_node = Some(node);
+        }
+        if self.device_lost {
+            return None;
+        }
         if matches!(self.engine, Engine::Uninitialized) {
             let (sender, receiver) = std::sync::mpsc::channel();
             match std::thread::Builder::new()
@@ -97,6 +158,7 @@ impl TransferState {
             match receiver.try_recv() {
                 Ok(Ok(engine)) => self.engine = Engine::Ready(engine),
                 Ok(Err(err)) => {
+                    self.device_lost |= err.is_device_lost();
                     warn!("Vulkan transfer initialization failed: {err}");
                     self.engine = Engine::Failed;
                 }
@@ -119,20 +181,113 @@ impl TransferState {
         format: Fourcc,
         size: Size<i32, Buffer>,
     ) -> Option<Vec<Modifier>> {
-        match self
+        self.engine(node)?;
+        let key = (format, size.w, size.h);
+        if let Some(caps) = self.source_caps.get(&key) {
+            return Some(caps);
+        }
+        let result = self
             .engine(node)?
-            .source_modifiers(format, size.w as u32, size.h as u32)
-        {
-            Ok(modifiers) if !modifiers.is_empty() => Some(modifiers),
-            result => {
-                if let Err(err) = result {
-                    self.device_lost |= err.is_device_lost();
-                    warn!("Vulkan source modifier negotiation failed: {err}");
+            .source_modifiers(format, size.w as u32, size.h as u32);
+        match result {
+            Ok(caps) => {
+                self.source_caps.insert(key, caps.clone());
+                Some(caps)
+            }
+            Err(err) => {
+                self.device_lost |= err.is_device_lost();
+                warn!("Vulkan source modifier negotiation failed: {err}");
+                if self.device_lost {
+                    self.disable();
+                } else if matches!(err, VkBridgeError::Unsupported(_)) {
+                    self.source_caps.insert(key, Vec::new());
                 }
-                self.disable();
-                None
+                Some(Vec::new())
             }
         }
+    }
+
+    pub fn prefers_direct(&self) -> bool {
+        self.direct_target_enabled && self.copy_device == super::VulkanCopyDevice::Target
+    }
+
+    pub fn copy_node(&self, render: DrmNode, target: DrmNode) -> DrmNode {
+        self.copy_device.node(render, target)
+    }
+
+    pub fn destination_modifiers(
+        &mut self,
+        node: DrmNode,
+        format: Fourcc,
+        size: Size<i32, Buffer>,
+    ) -> Option<Vec<Modifier>> {
+        if self.engine(node).is_none() {
+            return matches!(self.engine, Engine::Failed).then(Vec::new);
+        }
+        let key = (format, size.w, size.h);
+        if let Some(caps) = self.destination_caps.get(&key) {
+            return Some(caps);
+        }
+        match self
+            .engine(node)?
+            .destination_modifiers(format, size.w as u32, size.h as u32)
+        {
+            Ok(caps) => {
+                self.destination_caps.insert(key, caps.clone());
+                Some(caps)
+            }
+            Err(err) => {
+                self.device_lost |= err.is_device_lost();
+                warn!("Vulkan destination modifier negotiation failed: {err}");
+                if self.device_lost {
+                    self.disable();
+                } else if matches!(err, VkBridgeError::Unsupported(_)) {
+                    self.destination_caps.insert(key, Vec::new());
+                }
+                Some(Vec::new())
+            }
+        }
+    }
+
+    /// Rate-limit retries by exact format, extent and source/destination layout.
+    /// Cleared on source replacement, so a new allocation is never rejected by an old fd.
+    pub fn intermediate_allowed(&mut self, source: &Dmabuf, modifier: Modifier) -> bool {
+        self.allow_intermediate_key((
+            source.format().code,
+            source.size().w,
+            source.size().h,
+            source.format().modifier,
+            modifier,
+        ))
+    }
+
+    fn allow_intermediate_key(&mut self, key: IntermediateKey) -> bool {
+        self.intermediate_retries
+            .get(&key)
+            .is_none_or(|deadline| std::time::Instant::now() >= deadline)
+    }
+
+    pub fn defer_intermediate(&mut self, source: &Dmabuf, modifier: Modifier, deterministic: bool) {
+        // Retry transient failures after one second; descriptor rejections after ten.
+        // Wall time avoids nested layout/whole-attempt backoffs multiplying each other.
+        self.intermediate_retries.insert(
+            (
+                source.format().code,
+                source.size().w,
+                source.size().h,
+                source.format().modifier,
+                modifier,
+            ),
+            std::time::Instant::now() + std::time::Duration::from_secs(if deterministic { 10 } else { 1 }),
+        );
+    }
+
+    /// Discard only the intermediate allocation, never its still-running reader.
+    /// The source's copy/reuse fence remains intact for the next GLES write.
+    pub fn discard_destination(&mut self) {
+        wait(&self.destination_release);
+        self.destination_release = SyncPoint::signaled();
+        self.destination = None;
     }
 
     pub fn disable(&mut self) {
@@ -152,7 +307,17 @@ impl TransferState {
         self.destination = None;
         self.source = None;
         self.rejected_direct_targets.clear();
+        self.intermediate_retries.clear();
     }
+}
+
+/// Prefer portable forward copies, but device-native reverse destinations.
+/// Callers exclude implicit/unsupported modifiers before ordering.
+pub(super) fn order_destination_modifiers(role: super::VulkanCopyDevice, modifiers: &mut [Modifier]) {
+    modifiers.sort_by_key(|modifier| match role {
+        super::VulkanCopyDevice::Render => *modifier != Modifier::Linear,
+        super::VulkanCopyDevice::Target => *modifier == Modifier::Linear,
+    });
 }
 
 /// A direct write must not enlarge damage: the shared staging allocation is valid only
@@ -417,6 +582,119 @@ mod tests {
         state.invalidate();
         assert!(state.direct_target_enabled);
         assert!(state.matches_generation(&generation));
+    }
+
+    #[test]
+    fn explicit_target_direct_policy_and_invalidation() {
+        use super::super::VulkanCopyDevice;
+        let mut state = TransferState::default();
+        assert_eq!(state.copy_device, VulkanCopyDevice::Render);
+        assert!(!state.prefers_direct());
+        state.direct_target_enabled = true;
+        assert!(!state.prefers_direct());
+        state.copy_device = VulkanCopyDevice::Target;
+        assert!(state.prefers_direct());
+        state
+            .source_caps
+            .insert((Fourcc::Xrgb8888, 1920, 1080), Vec::new());
+        state.invalidate();
+        assert!(state.prefers_direct());
+        assert!(state.source_caps.is_empty());
+        state.direct_target_enabled = false;
+        assert!(!state.prefers_direct());
+    }
+
+    #[test]
+    fn destination_order_is_role_specific_and_stable() {
+        use super::super::VulkanCopyDevice;
+        let native_a = Modifier::from(0x0300_0000_0000_0010u64);
+        let native_b = Modifier::from(0x0300_0000_0000_0011u64);
+        let mut modifiers = [native_a, Modifier::Linear, native_b];
+        order_destination_modifiers(VulkanCopyDevice::Render, &mut modifiers);
+        assert_eq!(modifiers, [Modifier::Linear, native_a, native_b]);
+        order_destination_modifiers(VulkanCopyDevice::Target, &mut modifiers);
+        assert_eq!(modifiers, [native_a, native_b, Modifier::Linear]);
+    }
+
+    #[test]
+    fn source_rejection_cache_is_format_and_extent_scoped() {
+        let mut state = TransferState::default();
+        state
+            .source_caps
+            .insert((Fourcc::Xrgb8888, 1920, 1080), Vec::new());
+        assert!(state.source_caps.contains_key(&(Fourcc::Xrgb8888, 1920, 1080)));
+        assert!(!state.source_caps.contains_key(&(Fourcc::Xrgb2101010, 1920, 1080)));
+        assert!(!state.source_caps.contains_key(&(Fourcc::Xrgb8888, 1280, 720)));
+        assert!(matches!(state.engine, Engine::Uninitialized));
+    }
+
+    #[test]
+    fn capability_cache_is_bounded_lru_including_negative_results() {
+        let mut cache = Cache::default();
+        for key in 0..CACHE_LIMIT {
+            cache.insert(key, Vec::<Modifier>::new());
+        }
+        assert_eq!(cache.get(&0), Some(Vec::new()));
+        cache.insert(CACHE_LIMIT, vec![Modifier::Linear]);
+        assert_eq!(cache.0.len(), CACHE_LIMIT);
+        assert!(cache.contains_key(&0));
+        assert!(!cache.contains_key(&1));
+        cache.insert(0, vec![Modifier::Linear]);
+        assert_eq!(cache.0.len(), CACHE_LIMIT);
+        assert_eq!(cache.get(&0), Some(vec![Modifier::Linear]));
+    }
+
+    #[test]
+    fn intermediate_retry_is_scoped_bounded_and_not_engine_failure() {
+        let mut state = TransferState::default();
+        let key = (Fourcc::Xrgb8888, 1920, 1080, Modifier::Linear, Modifier::Linear);
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        state.intermediate_retries.insert(key, later);
+        assert!(!state.allow_intermediate_key(key));
+        state.intermediate_retries.insert(key, std::time::Instant::now());
+        assert!(state.allow_intermediate_key(key));
+        let other = (
+            Fourcc::Xrgb2101010,
+            1920,
+            1080,
+            Modifier::Linear,
+            Modifier::Linear,
+        );
+        assert!(state.allow_intermediate_key(other));
+        for width in 0..32 {
+            state.intermediate_retries.insert(
+                (Fourcc::Xrgb8888, width, 1080, Modifier::Linear, Modifier::Linear),
+                later,
+            );
+        }
+        assert_eq!(state.intermediate_retries.0.len(), CACHE_LIMIT);
+        assert!(matches!(state.engine, Engine::Uninitialized));
+        state.retire_buffers();
+        assert!(state.intermediate_retries.is_empty());
+    }
+
+    #[test]
+    fn destination_discard_waits_reader_and_preserves_source_fence() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut state = TransferState::default();
+        state.source_release = TrackingFence {
+            name: "source",
+            calls: calls.clone(),
+            interrupt: AtomicBool::new(false),
+        }
+        .into();
+        state.destination_release = TrackingFence {
+            name: "target",
+            calls: calls.clone(),
+            interrupt: AtomicBool::new(true),
+        }
+        .into();
+        state.discard_destination();
+        assert_eq!(*calls.lock().unwrap(), ["target", "target"]);
+        assert!(state.source_release.contains_fence());
+        assert!(state.destination_release.is_reached());
+        drop(state);
+        assert_eq!(*calls.lock().unwrap(), ["target", "target", "source"]);
     }
 
     #[test]

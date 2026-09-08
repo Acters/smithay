@@ -314,3 +314,31 @@ These are sequential machine-specific measurements, not a promise of zero jitter
 a GPU-execution-time measurement or proof of a particular driver lock. The niri
 checkout's `docs/vulkan-submission-pool.md` records the full settings, raw-data path,
 remaining caveats and rollback.
+
+## Opt-in target-side copy device / reverse bridge
+
+`VulkanCopyDevice::Render` is the default. `Target` chooses the output GPU for
+Vulkan, independently of the GLES scene renderer. The role, exact node and source
+manager epoch belong to each transfer pair and changing them retires storage.
+`vulkan_transfer_target_modifiers` shares that pair's background engine and returns
+None while initializing, Some(empty) when unavailable, or exact destination
+modifiers. Capability/retry caches are bounded and keyed by format/extent/layout;
+recoverable candidate errors do not disable all formats on the pair.
+
+With Target + direct enabled, a valid shared texture is retained as fallback but
+the current source is first offered to the direct Vulkan path. Shared GLES reader
+completion is tracked before later source writes/foreign ownership. Intermediate
+allocations intersect Vulkan destination and target sampling capabilities; native
+modifiers are preferred for Target, LINEAR for the existing Render-side route.
+Actual descriptors, original framebuffer hooks, external leases and exact damage
+remain mandatory. No copy/format-conversion algorithm or pooled-fence contract is
+changed by role selection.
+
+Fresh Intel renderD128 -> NVIDIA copy/target renderD129 offscreen tests passed in
+ABGR8888/ABGR2101010. Source negotiation selected LINEAR; native target negotiation
+selected modifier216172782120099860. Engine/pool stress, SCANOUT-requested full-HD
+allocation, and actual MultiRenderer direct-counter/pixel/capture/blit/resize
+regressions passed. Ordinary shared-GLES fallback and NVIDIA->Intel tests also pass.
+Niri's `docs/intel-nvidia-bridge.md` records the setup. Real NVIDIA KMS transition,
+copy-fence presentation, pacing and idle-power behavior are separate live gates;
+source-side Intel rendering into LINEAR is not assumed optimal for every workload.

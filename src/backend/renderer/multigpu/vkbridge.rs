@@ -483,10 +483,31 @@ fn pool_busy(pending: usize) -> bool {
     pending >= MAX_PENDING
 }
 
-struct SourceModifiers {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModifierRole {
+    Source,
+    Destination,
+}
+
+impl ModifierRole {
+    fn usage(self) -> vk::ImageUsageFlags {
+        match self {
+            Self::Source => vk::ImageUsageFlags::TRANSFER_SRC,
+            Self::Destination => vk::ImageUsageFlags::TRANSFER_DST,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ModifierQuery {
+    role: ModifierRole,
     fourcc: Fourcc,
     width: u32,
     height: u32,
+}
+
+struct QueriedModifiers {
+    query: ModifierQuery,
     modifiers: Vec<Modifier>,
 }
 
@@ -499,7 +520,7 @@ pub struct VkBridge {
     pending: Vec<Arc<Completion>>,
     // idle + pending <= MAX_PENDING. Idle slots contain no images or old completions.
     idle: Vec<Resources>,
-    source_modifiers: VecDeque<SourceModifiers>,
+    modifier_queries: VecDeque<QueriedModifiers>,
 }
 
 impl Drop for VkBridge {
@@ -587,7 +608,7 @@ impl VkBridge {
             .find(|phd| {
                 phd.api_version() >= Version::VERSION_1_2
                     && required.iter().all(|name| phd.has_device_extension(name))
-                    // No primary-node or vendor fallback: the bridge must use the render GPU.
+                    // No primary-node or vendor fallback: use exactly the requested copy GPU.
                     && phd.render_node().ok().flatten() == Some(node)
             })
             .ok_or_else(|| {
@@ -661,7 +682,7 @@ impl VkBridge {
             imports: VecDeque::new(),
             pending: Vec::with_capacity(MAX_PENDING),
             idle: Vec::with_capacity(MAX_PENDING),
-            source_modifiers: VecDeque::new(),
+            modifier_queries: VecDeque::new(),
         })
     }
 
@@ -673,41 +694,78 @@ impl VkBridge {
     /// The result is numerically sorted, not a performance preference. An empty result means
     /// no supported combination. Unknown FourCCs and zero/non-i32 dimensions are errors.
     ///
-    /// Up to eight FourCC/size queries (including empty results) are cached. Negotiation does
-    /// not guarantee a particular allocation can be imported: actual fd memory types, plane
-    /// layout and descriptor compatibility are still validated by [`Self::copy`].
+    /// Up to eight role/FourCC/size queries (including empty results) are cached, shared with
+    /// [`Self::destination_modifiers`]. Negotiation does not guarantee a particular allocation
+    /// can be imported: actual fd memory types, plane layout and descriptor compatibility are
+    /// still validated by [`Self::copy`].
     pub fn source_modifiers(
         &mut self,
         fourcc: Fourcc,
         width: u32,
         height: u32,
     ) -> Result<Vec<Modifier>, VkBridgeError> {
+        self.modifiers(ModifierRole::Source, fourcc, width, height)
+    }
+
+    /// Enumerate destination modifiers this engine can import for an exact format and size.
+    ///
+    /// Only explicit single-plane modifiers supporting `TRANSFER_DST` and DMA_BUF import
+    /// are returned. Intersect these with the target EGL render formats BEFORE allocating
+    /// a target-owned renderable destination. Results are numerically sorted, not ranked
+    /// by performance; an empty result means no supported combination. Unknown FourCCs and
+    /// zero/non-i32 dimensions are errors.
+    ///
+    /// Shares a bounded eight-entry role/FourCC/size query cache with [`Self::source_modifiers`],
+    /// including empty results. Actual fd memory types, plane layout and descriptor
+    /// compatibility are still validated by [`Self::copy`]; negotiation is not an import guarantee.
+    pub fn destination_modifiers(
+        &mut self,
+        fourcc: Fourcc,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<Modifier>, VkBridgeError> {
+        self.modifiers(ModifierRole::Destination, fourcc, width, height)
+    }
+
+    fn modifiers(
+        &mut self,
+        role: ModifierRole,
+        fourcc: Fourcc,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<Modifier>, VkBridgeError> {
         if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
-            return Err(VkBridgeError::Unsupported(
-                "invalid source modifier query dimensions",
-            ));
+            return Err(VkBridgeError::Unsupported(match role {
+                ModifierRole::Source => "invalid source modifier query dimensions",
+                ModifierRole::Destination => "invalid destination modifier query dimensions",
+            }));
         }
         let format = get_vk_format(fourcc).ok_or(VkBridgeError::Unsupported("unknown FourCC"))?;
+        let query = ModifierQuery {
+            role,
+            fourcc,
+            width,
+            height,
+        };
         if let Some(index) = self
-            .source_modifiers
+            .modifier_queries
             .iter()
-            .position(|entry| entry.fourcc == fourcc && entry.width == width && entry.height == height)
+            .position(|entry| entry.query == query)
         {
-            let entry = self.source_modifiers.remove(index).unwrap();
+            let entry = self.modifier_queries.remove(index).unwrap();
             let result = entry.modifiers.clone();
-            self.source_modifiers.push_back(entry);
+            self.modifier_queries.push_back(entry);
             return Ok(result);
         }
         let mut modifiers = Vec::new();
         for candidate in self.core.modifier_properties(format)? {
-            if !single_plane_transfer(&candidate, true) {
+            if !single_plane_transfer(&candidate, role == ModifierRole::Source) {
                 continue;
             }
-            if let Some(limits) = self.core.import_properties(
-                format,
-                candidate.drm_format_modifier,
-                vk::ImageUsageFlags::TRANSFER_SRC,
-            )? {
+            if let Some(limits) =
+                self.core
+                    .import_properties(format, candidate.drm_format_modifier, role.usage())?
+            {
                 if fits_image(&limits, width, height) {
                     modifiers.push(Modifier::from(candidate.drm_format_modifier));
                 }
@@ -715,13 +773,11 @@ impl VkBridge {
         }
         modifiers.sort_by_key(|&modifier| u64::from(modifier));
         modifiers.dedup();
-        if self.source_modifiers.len() == MAX_MODIFIER_QUERIES {
-            self.source_modifiers.pop_front();
+        if self.modifier_queries.len() == MAX_MODIFIER_QUERIES {
+            self.modifier_queries.pop_front();
         }
-        self.source_modifiers.push_back(SourceModifiers {
-            fourcc,
-            width,
-            height,
+        self.modifier_queries.push_back(QueriedModifiers {
+            query,
             modifiers: modifiers.clone(),
         });
         Ok(modifiers)
@@ -1486,6 +1542,44 @@ mod tests {
         assert!(
             old.iter_mut()
                 .all(|state| state.owned.is_none() && state.observe(Ok(false)) == Ok(true))
+        );
+    }
+
+    #[test]
+    fn modifier_query_key_distinguishes_role_format_and_extent() {
+        let source = ModifierQuery {
+            role: ModifierRole::Source,
+            fourcc: Fourcc::Abgr8888,
+            width: 256,
+            height: 160,
+        };
+        let destination = ModifierQuery {
+            role: ModifierRole::Destination,
+            ..source
+        };
+        assert_ne!(source, destination);
+        assert_eq!(source.role.usage(), vk::ImageUsageFlags::TRANSFER_SRC);
+        assert_eq!(destination.role.usage(), vk::ImageUsageFlags::TRANSFER_DST);
+        let cached = [QueriedModifiers {
+            query: source,
+            modifiers: Vec::new(),
+        }];
+        assert!(cached.iter().any(|entry| entry.query == source));
+        assert!(!cached.iter().any(|entry| entry.query == destination));
+        assert_ne!(
+            source,
+            ModifierQuery {
+                fourcc: Fourcc::Argb8888,
+                ..source
+            }
+        );
+        assert_ne!(source, ModifierQuery { width: 257, ..source });
+        assert_ne!(
+            source,
+            ModifierQuery {
+                height: 161,
+                ..source
+            }
         );
     }
 

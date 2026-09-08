@@ -15,6 +15,27 @@
 //! fds. Vendor loaders/ICDs still run inside this process; run only when hardware testing is
 //! authorized. Direct-engine mode never substitutes CPU copies for Vulkan transfers.
 //!
+//! Direct-engine reverse-direction candidate (offscreen only; not proof of hardware support):
+//! ```text
+//! timeout --signal=TERM --kill-after=5s 60s target/debug/examples/vulkan_transfer \
+//!   --source /dev/dri/renderD128 --target /dev/dri/renderD129 \
+//!   --copy-node /dev/dri/renderD129 --native-target --format abgr8888
+//! ```
+//! `--copy-node` defaults to source and must name either supplied render GPU. `--native-target`
+//! requires `backend_gbm_has_create_with_modifiers2` in addition to the build features above;
+//! it intersects target EGL RENDER formats with Vulkan TRANSFER_DST import support and requests
+//! target-owned RENDERING allocations (SCANOUT|RENDERING with `--scanout-candidate`). Native
+//! negotiation may still select LINEAR; inspect the actual printed modifiers. Without this flag,
+//! destinations remain LINEAR. In direct-engine mode target GLES samples the Vulkan destination
+//! into a separate readback buffer; it never populates the destination.
+//!
+//! Add `--multigpu --direct-target` to the reverse command for the actual MultiRenderer route.
+//! `--copy-node` also selects that manager's copy device. `--native-target --multigpu` requires
+//! `--direct-target`: target modifiers come from the SAME manager engine, with bounded startup
+//! polling, intersected with target GLES dma-buf Bind formats for each size. This opt-in mode
+//! enables timing counters and requires direct Vulkan copies for every measured Vulkan stage,
+//! not merely fallback pixel success (the explicit target-GLES stage remains deliberately GLES).
+//!
 //! Add `--multigpu` to exercise GpuManager/MultiRenderer instead, with two alternating
 //! offscreen outputs, partial damage, mixed sizes and cache invalidation. That mode permits
 //! the real renderer's route selection/fallbacks: pixel success alone does NOT prove Vulkan
@@ -57,7 +78,7 @@ use smithay::{
             TextureMapping,
             gles::{GlesRenderbuffer, GlesRenderer, GlesTexture},
             multigpu::{
-                ApiDevice, GpuManager,
+                ApiDevice, GpuManager, VulkanCopyDevice,
                 gbm::GbmGlesBackend,
                 timing::{self, Counter},
                 vkbridge::VkBridge,
@@ -98,6 +119,12 @@ struct Args {
     /// Target GPU render node, distinct from source.
     #[arg(long)]
     target: PathBuf,
+    /// Vulkan copy render node (defaults to source); must equal source or target.
+    #[arg(long)]
+    copy_node: Option<PathBuf>,
+    /// Negotiate target-owned EGL render/Vulkan modifiers; with --multigpu requires --direct-target.
+    #[arg(long)]
+    native_target: bool,
     #[arg(long, value_enum, default_value = "abgr8888")]
     format: PixelFormat,
     /// Frames per size (direct) or per output per round (multigpu), excluding warmup.
@@ -122,6 +149,15 @@ struct Args {
     /// Stress pooled fences/reuse; requires --frames >=64 and SMITHAY_FRAME_TIMING=1.
     #[arg(long, conflicts_with_all = ["multigpu", "direct_target"])]
     pool_stress: bool,
+}
+
+impl Args {
+    fn validate_modes(&self) -> ProbeResult<()> {
+        if self.native_target && self.multigpu && !self.direct_target {
+            return Err("--native-target with --multigpu requires --direct-target".into());
+        }
+        Ok(())
+    }
 }
 
 fn parse_modifier(value: &str) -> Result<u64, std::num::ParseIntError> {
@@ -652,12 +688,33 @@ fn run_size(
     if modifiers.is_empty() {
         return Err("no explicit native source render modifiers".into());
     }
-    if !target.texture_formats.contains(&Format {
-        code: format,
-        modifier: Modifier::Linear,
-    }) {
-        return Err("target EGL does not advertise requested LINEAR sample format".into());
-    }
+    let destination_modifiers = if args.native_target {
+        let transfer_modifiers = bridge.destination_modifiers(format, w as u32, h as u32)?;
+        let mut modifiers: Vec<_> = target
+            .render_formats
+            .iter()
+            .filter(|f| f.code == format && transfer_modifiers.contains(&f.modifier))
+            .map(|f| f.modifier)
+            .collect();
+        modifiers.sort_by_key(|&m| (m == Modifier::Linear, u64::from(m)));
+        modifiers.dedup();
+        println!(
+            "NEGOTIATE destination modifiers shared by target EGL RENDER/Vulkan TRANSFER_DST: {:?}",
+            modifiers.iter().copied().map(u64::from).collect::<Vec<_>>()
+        );
+        if modifiers.is_empty() {
+            return Err("no explicit target EGL render/Vulkan destination modifiers".into());
+        }
+        modifiers
+    } else {
+        if !target.texture_formats.contains(&Format {
+            code: format,
+            modifier: Modifier::Linear,
+        }) {
+            return Err("target EGL does not advertise requested LINEAR sample format".into());
+        }
+        vec![Modifier::Linear]
+    };
     let source_bo = source
         .allocator
         .create_buffer(w as u32, h as u32, format, &modifiers)?;
@@ -669,24 +726,30 @@ fn run_size(
             return Err("--scanout-candidate requires backend_gbm_has_create_with_modifiers2 so GBM receives usage flags together with explicit modifiers".into());
         }
         println!(
-            "SCANOUT CANDIDATE: requesting SCANOUT|RENDERING with explicit LINEAR; KMS admissibility is NOT tested"
+            "SCANOUT CANDIDATE: requesting SCANOUT|RENDERING with explicit destination modifiers; KMS admissibility is NOT tested"
         );
         target.allocator.create_buffer_with_flags(
             w as u32,
             h as u32,
             format,
-            &[Modifier::Linear],
+            &destination_modifiers,
             GbmBufferFlags::SCANOUT | GbmBufferFlags::RENDERING,
         )?
     } else {
         target
             .allocator
-            .create_buffer(w as u32, h as u32, format, &[Modifier::Linear])?
+            .create_buffer(w as u32, h as u32, format, &destination_modifiers)?
     };
     let mut src = source_bo.export()?;
     let dst = destination_bo.export()?;
-    if dst.format().modifier != Modifier::Linear || src.format().modifier == Modifier::Invalid {
-        return Err("GBM returned implicit source or non-LINEAR destination".into());
+    if !modifiers.contains(&src.format().modifier) || !destination_modifiers.contains(&dst.format().modifier)
+    {
+        return Err(format!(
+            "GBM returned modifiers outside negotiated sets: source={:?}, destination={:?}",
+            src.format().modifier,
+            dst.format().modifier
+        )
+        .into());
     }
     println!(
         "ALLOC size={w}x{h} source={:?}/{} planes={} destination={:?}/{} planes={}",
@@ -1280,6 +1343,73 @@ fn draw_direct_output(
     Ok(())
 }
 
+// Startup polling is deliberately confined to this offscreen probe. Query the SAME manager
+// engine that will execute the measured frames, including after each cache invalidation.
+fn native_multigpu_modifiers(
+    manager: &mut MultiGpuManager,
+    source: &DrmNode,
+    target: &DrmNode,
+    format: Fourcc,
+    width: i32,
+    height: i32,
+) -> ProbeResult<Vec<Modifier>> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let transfer = loop {
+        match manager.vulkan_transfer_target_modifiers(source, target, format, (width, height).into())? {
+            Some(modifiers) => break modifiers,
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            None => return Err("timed out waiting for manager Vulkan destination modifier query".into()),
+        }
+    };
+    let device = manager
+        .devices_mut()?
+        .find(|device| device.node() == target)
+        .ok_or("target missing")?;
+    let render_formats = <GlesRenderer as Bind<Dmabuf>>::supported_formats(device.renderer())
+        .ok_or("target GLES does not expose dma-buf binding formats")?;
+    let mut modifiers: Vec<_> = render_formats
+        .iter()
+        .filter(|f| f.code == format && f.modifier != Modifier::Invalid && transfer.contains(&f.modifier))
+        .map(|f| f.modifier)
+        .collect();
+    modifiers.sort_by_key(|&m| (m == Modifier::Linear, u64::from(m)));
+    modifiers.dedup();
+    println!(
+        "NEGOTIATE MultiRenderer target size={width}x{height} format={format:?} EGL BIND/Vulkan TRANSFER_DST modifiers={:?}",
+        modifiers.iter().copied().map(u64::from).collect::<Vec<_>>()
+    );
+    if modifiers.is_empty() {
+        return Err("manager Vulkan destination/target GLES bind modifier intersection unavailable".into());
+    }
+    Ok(modifiers)
+}
+
+fn assert_native_direct_route(sequence: u32) -> ProbeResult<()> {
+    let mut direct = 0;
+    let mut intermediate = 0;
+    let mut cpu = 0;
+    for snapshot in timing::drain() {
+        for (counter, count) in snapshot.counters {
+            match counter {
+                Counter::DirectCopies => direct += count,
+                Counter::IntermediateCopies => intermediate += count,
+                Counter::CpuCopies => cpu += count,
+                _ => {}
+            }
+        }
+    }
+    let explicit_gles = sequence % 6 == 2;
+    if intermediate != 0 || cpu != 0 || (if explicit_gles { direct != 0 } else { direct == 0 }) {
+        return Err(format!(
+            "native MultiRenderer route proof failed: sequence={sequence} explicit_gles={explicit_gles} direct={direct} intermediate={intermediate} cpu={cpu}"
+        ).into());
+    }
+    println!(
+        "PASS ROUTE sequence={sequence} explicit_gles={explicit_gles} direct={direct} intermediate={intermediate} cpu={cpu}"
+    );
+    Ok(())
+}
+
 fn run_direct_targets(
     manager: &mut MultiGpuManager,
     source: &DrmNode,
@@ -1287,6 +1417,15 @@ fn run_direct_targets(
     args: &Args,
 ) -> ProbeResult<()> {
     manager.set_vulkan_direct_target_enabled(true);
+    // Native MultiRenderer must prove the actual route, not just successful fallback pixels.
+    // This standalone process owns its timing collector; the default probe remains unchanged.
+    let _route_scope = if args.native_target {
+        timing::set_enabled(true);
+        timing::register_stream((2, 1), "native-target MultiRenderer route proof");
+        Some(timing::enter((2, 1)).ok_or("could not enter route-proof timing scope")?)
+    } else {
+        None
+    };
     let shared_context = {
         let device = manager
             .devices_mut()?
@@ -1301,9 +1440,15 @@ fn run_direct_targets(
     let format = Fourcc::from(args.format);
     let base = (args.width as i32, args.height as i32);
     let mixed = [base, (base.0 + 32, base.1 + 24), (base.0 + 16, base.1 + 8)];
-    println!(
-        "DIRECT-TARGET route proof requires 'submitted direct Vulkan framebuffer transfer' logs. Pixel PASS alone cannot distinguish fallback; no KMS access or scanout activation."
-    );
+    if args.native_target {
+        println!(
+            "DIRECT-TARGET native route proof: per-draw DirectCopies required outside explicit GLES stage; no intermediate/CPU copies allowed in measured draws. No KMS access or scanout activation."
+        );
+    } else {
+        println!(
+            "DIRECT-TARGET route proof requires 'submitted direct Vulkan framebuffer transfer' logs. Pixel PASS alone cannot distinguish fallback; no KMS access or scanout activation."
+        );
+    }
     for (round, sizes) in [[base; 3], mixed, [base; 3]].into_iter().enumerate() {
         if round != 0 {
             println!("INVALIDATE direct-target caches round={round}");
@@ -1311,22 +1456,34 @@ fn run_direct_targets(
         }
         let mut outputs = Vec::new();
         for (width, height) in sizes {
+            let modifiers = if args.native_target {
+                native_multigpu_modifiers(manager, source, target, format, width, height)?
+            } else {
+                vec![Modifier::Linear]
+            };
             let device = manager
                 .devices_mut()?
                 .find(|device| device.node() == target)
                 .ok_or("target missing")?;
-            let dmabuf =
-                device
-                    .allocator()
-                    .create_buffer(width as u32, height as u32, format, &[Modifier::Linear])?;
-            if dmabuf.format().modifier != Modifier::Linear
+            let dmabuf = device
+                .allocator()
+                .create_buffer(width as u32, height as u32, format, &modifiers)?;
+            println!(
+                "ALLOC MultiRenderer original target round={round} index={} size={width}x{height} format={:?} modifier={} planes={}",
+                outputs.len(),
+                dmabuf.format().code,
+                u64::from(dmabuf.format().modifier),
+                dmabuf.num_planes()
+            );
+            if !modifiers.contains(&dmabuf.format().modifier)
                 || dmabuf.format().code != format
                 || dmabuf.size().w != width
                 || dmabuf.size().h != height
                 || dmabuf.num_planes() != 1
             {
                 return Err(
-                    "direct destination is not the requested original single-plane LINEAR descriptor".into(),
+                    "direct destination is not the requested original single-plane negotiated descriptor"
+                        .into(),
                 );
             }
             let scratch: GlesRenderbuffer =
@@ -1395,7 +1552,14 @@ fn run_direct_targets(
                 println!(
                     "MEASURE direct-target round={round} output={index} sequence={sequence} stage={stage}"
                 );
+                if args.native_target {
+                    // Exclude warmup, seeding, captures and previous outputs from this draw's proof.
+                    let _ = timing::drain();
+                }
                 draw_direct_output(manager, source, target, format, output, sequence, index, false)?;
+                if args.native_target {
+                    assert_native_direct_route(sequence)?;
+                }
                 println!(
                     "SUBMIT direct-target round={round} output={index} sequence={sequence} exact_damage={:?} release_native={} complete_at_return={}",
                     output.damage,
@@ -1431,6 +1595,11 @@ fn run_direct_targets(
         }
         manager.set_vulkan_direct_target_enabled(true);
     }
+    if args.native_target {
+        println!(
+            "PASS NATIVE MULTIRENDERER ROUTE: direct Vulkan counters verified for every measured non-GLES draw across all sizes/cache invalidations; explicit target-GLES stages checked separately."
+        );
+    }
     println!(
         "PASS DIRECT-TARGET PIXELS: {:?}, {} measured writes, 3 original targets, exact outside-damage preservation, capture, fallback/GLES, blit_to/from, resize/cache invalidation. Inspect direct-route logs; no scanout or validation-layer claim.",
         args.format,
@@ -1444,22 +1613,32 @@ fn run_multigpu(
     source_file: File,
     target_node: DrmNode,
     target_file: File,
+    copy_node: DrmNode,
     args: &Args,
 ) -> ProbeResult<()> {
     println!(
-        "INIT MultiRenderer source={} target={} (render nodes only; no master/KMS)",
+        "INIT MultiRenderer renderer={} copy={} target={} native_target={} (render nodes only; no master/KMS)",
         args.source.display(),
-        args.target.display()
+        args.copy_node.as_deref().unwrap_or(&args.source).display(),
+        args.target.display(),
+        args.native_target
     );
-    println!(
-        "ROUTE NOT ASSERTED: pixel PASS does not prove Vulkan. Inspect successful-copy debug logs with RUST_LOG=smithay::backend::renderer::multigpu=debug, including after INVALIDATE."
-    );
+    if !args.native_target {
+        println!(
+            "ROUTE NOT ASSERTED: pixel PASS does not prove Vulkan. Inspect successful-copy debug logs with RUST_LOG=smithay::backend::renderer::multigpu=debug, including after INVALIDATE."
+        );
+    }
     let mut backend = GbmGlesBackend::<GlesRenderer, DeviceFd>::default();
     for (node, file) in [(source_node, source_file), (target_node, target_file)] {
         let gbm = GbmDevice::new(DeviceFd::from(OwnedFd::from(file)))?;
         backend.add_node(node, gbm)?;
     }
     let mut manager = GpuManager::new(backend)?;
+    manager.set_vulkan_copy_device(if copy_node == target_node {
+        VulkanCopyDevice::Target
+    } else {
+        VulkanCopyDevice::Render
+    });
     if args.direct_target {
         return run_direct_targets(&mut manager, &source_node, &target_node, args);
     }
@@ -1572,6 +1751,63 @@ mod direct_tests {
     use super::*;
 
     #[test]
+    fn reverse_probe_flags_preserve_defaults_and_validate_native_multigpu() {
+        let base = [
+            "vulkan_transfer",
+            "--source",
+            "/dev/dri/renderD128",
+            "--target",
+            "/dev/dri/renderD129",
+        ];
+        let defaults = Args::try_parse_from(base).unwrap();
+        assert!(defaults.copy_node.is_none());
+        assert!(!defaults.native_target);
+        let parse_extra = |extra: &[&str]| -> ProbeResult<Args> {
+            let args = Args::try_parse_from(base.into_iter().chain(extra.iter().copied()))?;
+            args.validate_modes()?;
+            Ok(args)
+        };
+        let reverse = parse_extra(&[
+            "--copy-node",
+            "/dev/dri/renderD129",
+            "--native-target",
+            "--format",
+            "abgr8888",
+        ])
+        .unwrap();
+        assert_eq!(
+            reverse.copy_node.as_deref(),
+            Some(Path::new("/dev/dri/renderD129"))
+        );
+        assert!(reverse.native_target);
+        assert!(parse_extra(&["--native-target", "--scanout-candidate"]).is_ok());
+        assert!(parse_extra(&["--native-target", "--pool-stress", "--frames", "64"]).is_ok());
+        assert!(parse_extra(&["--native-target", "--multigpu"]).is_err());
+        assert!(parse_extra(&["--native-target", "--direct-target"]).is_err());
+        assert!(parse_extra(&["--copy-node", "/dev/dri/renderD129", "--multigpu"]).is_ok());
+        assert!(parse_extra(&["--multigpu", "--direct-target"]).is_ok());
+        assert!(
+            parse_extra(&[
+                "--copy-node",
+                "/dev/dri/renderD129",
+                "--native-target",
+                "--multigpu",
+                "--direct-target",
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse_extra(&[
+                "--native-target",
+                "--multigpu",
+                "--direct-target",
+                "--scanout-candidate"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn direct_damage_keeps_holes_and_exceeds_cpu_rect_cap() {
         let (width, height) = (192, 120);
         let l_shape = direct_damage(width, height, 1);
@@ -1618,8 +1854,12 @@ mod direct_tests {
 
 fn main() -> ProbeResult<()> {
     let args = Args::parse();
+    args.validate_modes()?;
     if args.pool_stress && (args.frames < 64 || !timing::enabled()) {
         return Err("--pool-stress requires --frames >=64 and SMITHAY_FRAME_TIMING=1".into());
+    }
+    if args.native_target && !cfg!(feature = "backend_gbm_has_create_with_modifiers2") {
+        return Err("--native-target requires backend_gbm_has_create_with_modifiers2 so GBM receives RENDERING usage with explicit modifiers".into());
     }
     if !cfg!(target_endian = "little") {
         return Err("RGBA byte oracle requires little endian".into());
@@ -1634,13 +1874,34 @@ fn main() -> ProbeResult<()> {
     if source_node == target_node {
         return Err("source and target must be different render nodes".into());
     }
+    let copy_path = args.copy_node.as_deref().unwrap_or(&args.source);
+    // Validate/open explicit copy paths exactly like source/target; never enumerate card nodes.
+    // Retain the validated fd through the probe even though VkBridge selects by node identity.
+    let (copy_node, _copy_file) = if args.copy_node.is_some() {
+        let (node, file) = render_node(copy_path)?;
+        (node, Some(file))
+    } else {
+        (source_node, None)
+    };
+    if copy_node != source_node && copy_node != target_node {
+        return Err("copy node must equal the source or target render node".into());
+    }
     if args.multigpu {
-        return run_multigpu(source_node, source_file, target_node, target_file, &args);
+        return run_multigpu(
+            source_node,
+            source_file,
+            target_node,
+            target_file,
+            copy_node,
+            &args,
+        );
     }
     println!(
-        "INIT Vulkan source={} target={} (render nodes only; no master/KMS)",
+        "INIT Vulkan renderer={} copy={} target={} native_target={} (render nodes only; no master/KMS)",
         args.source.display(),
-        args.target.display()
+        copy_path.display(),
+        args.target.display(),
+        args.native_target
     );
     // One explicitly labelled pair on this recording thread; the worker intentionally
     // does not enter it (wait timing must not be confused with driver allocations).
@@ -1663,7 +1924,7 @@ fn main() -> ProbeResult<()> {
     } else {
         None
     };
-    let mut bridge = VkBridge::new(source_node)?;
+    let mut bridge = VkBridge::new(copy_node)?;
     println!("INIT source GBM/EGL");
     let mut source = Gpu::new(source_file)?;
     println!("INIT target GBM/EGL");

@@ -88,6 +88,27 @@ pub mod timing;
 #[cfg(feature = "backend_vulkan")]
 use transfer::TransferState;
 
+/// Device owning the optional Vulkan copy engine.
+#[cfg(feature = "backend_vulkan")]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum VulkanCopyDevice {
+    /// Use the primary rendering device (the default).
+    #[default]
+    Render,
+    /// Use the destination device, including its native destination layouts.
+    Target,
+}
+
+#[cfg(feature = "backend_vulkan")]
+impl VulkanCopyDevice {
+    fn node(self, render: DrmNode, target: DrmNode) -> DrmNode {
+        match self {
+            Self::Render => render,
+            Self::Target => target,
+        }
+    }
+}
+
 /// Tracks available gpus from a given [`GraphicsApi`]
 #[derive(Debug)]
 pub struct GpuManager<A: GraphicsApi> {
@@ -100,6 +121,8 @@ pub struct GpuManager<A: GraphicsApi> {
     vulkan_transfer_enabled: bool,
     #[cfg(feature = "backend_vulkan")]
     vulkan_direct_target_enabled: bool,
+    #[cfg(feature = "backend_vulkan")]
+    vulkan_copy_device: VulkanCopyDevice,
     #[cfg(feature = "backend_vulkan")]
     transfer_generation: Arc<()>,
     span: tracing::Span,
@@ -250,6 +273,7 @@ impl<A: GraphicsApi> GpuManager<A> {
         pair: (DrmNode, DrmNode),
         source_generation: Arc<()>,
         direct_target_enabled: bool,
+        copy_device: VulkanCopyDevice,
     ) {
         let stale = self
             .transfers
@@ -262,6 +286,7 @@ impl<A: GraphicsApi> GpuManager<A> {
         let state = self.transfers.entry(pair).or_default();
         state.source_generation = Some(source_generation);
         state.direct_target_enabled = direct_target_enabled;
+        state.copy_device = copy_device;
     }
 
     /// Enable or disable optional Vulkan transfers when direct DMA-BUF sharing fails.
@@ -290,6 +315,66 @@ impl<A: GraphicsApi> GpuManager<A> {
         }
     }
 
+    /// Select the copy engine owner, retiring storage and advancing the opaque epoch.
+    #[cfg(feature = "backend_vulkan")]
+    pub fn set_vulkan_copy_device(&mut self, role: VulkanCopyDevice) {
+        if self.vulkan_copy_device != role {
+            self.reset_transfer_storage();
+            self.vulkan_copy_device = role;
+        }
+    }
+
+    /// Current transfer epoch. Read after querying capabilities: enumeration can advance it.
+    #[cfg(feature = "backend_vulkan")]
+    pub fn vulkan_transfer_generation(&self) -> &Arc<()> {
+        &self.transfer_generation
+    }
+
+    /// Query exact transfer-destination layouts using the same pair state as `renderer`.
+    /// `None` means initialization is pending; an empty list means unavailable or disabled.
+    #[cfg(feature = "backend_vulkan")]
+    pub fn vulkan_transfer_target_modifiers(
+        &mut self,
+        render: &DrmNode,
+        target: &DrmNode,
+        format: Fourcc,
+        size: Size<i32, BufferCoords>,
+    ) -> Result<Option<Vec<Modifier>>, Error<A, A>> {
+        if !self.devices.iter().any(|device| device.node() == render)
+            || !self.devices.iter().any(|device| device.node() == target)
+            || self.api.needs_enumeration()
+        {
+            self.reset_transfer_storage();
+            self.api
+                .enumerate(&mut self.devices)
+                .map_err(Error::RenderApiError)?;
+        }
+        for node in [render, target] {
+            if !self.devices.iter().any(|device| device.node() == node) {
+                return Err(Error::NoDevice(*node));
+            }
+        }
+        self.prepare_transfer_pair(
+            (*render, *target),
+            self.transfer_generation.clone(),
+            self.vulkan_direct_target_enabled,
+            self.vulkan_copy_device,
+        );
+        if !self.vulkan_transfer_enabled || render == target {
+            return Ok(Some(Vec::new()));
+        }
+        let state = self.transfers.get_mut(&(*render, *target)).unwrap();
+        if state.device_lost {
+            return Err(Error::DeviceMissing);
+        }
+        let node = state.copy_node(*render, *target);
+        let caps = state.destination_modifiers(node, format, size);
+        if state.device_lost {
+            return Err(Error::DeviceMissing);
+        }
+        Ok(caps)
+    }
+
     /// Create a new [`GpuManager`] for a given [`GraphicsApi`].
     pub fn new(api: A) -> Result<GpuManager<A>, Error<A, A>> {
         let span = info_span!("renderer_multi", backend = A::identifier());
@@ -307,6 +392,8 @@ impl<A: GraphicsApi> GpuManager<A> {
             vulkan_transfer_enabled: true,
             #[cfg(feature = "backend_vulkan")]
             vulkan_direct_target_enabled: false,
+            #[cfg(feature = "backend_vulkan")]
+            vulkan_copy_device: VulkanCopyDevice::default(),
             #[cfg(feature = "backend_vulkan")]
             transfer_generation: Arc::new(()),
             span,
@@ -440,6 +527,7 @@ impl<A: GraphicsApi> GpuManager<A> {
             (*render_device, *target_device),
             self.transfer_generation.clone(),
             self.vulkan_direct_target_enabled,
+            self.vulkan_copy_device,
         );
         let (mut render, others) = self
             .devices
@@ -549,6 +637,7 @@ impl<A: GraphicsApi> GpuManager<A> {
             (*render_device, *target_device),
             render_api.transfer_generation.clone(),
             render_api.vulkan_direct_target_enabled,
+            render_api.vulkan_copy_device,
         );
         let (mut render, others) = render_api
             .devices
@@ -1376,23 +1465,82 @@ where
             #[cfg(feature = "backend_vulkan")]
             let mut transfer_modifiers = None;
             #[cfg(feature = "backend_vulkan")]
-            if target.cached_buffer.as_ref().is_some_and(|(direct, _)| !direct) {
-                if let Some(state) = target.transfer.as_deref_mut() {
-                    if state.device_lost {
-                        return Err(Error::DeviceMissing);
-                    }
-                    transfer_modifiers =
-                        state.source_modifiers(*self.render.node(), target.format, buffer_size);
+            if let Some(state) = target.transfer.as_deref_mut() {
+                if state.device_lost {
+                    return Err(Error::DeviceMissing);
+                }
+                if state.prefers_direct() || target.cached_buffer.as_ref().is_some_and(|(direct, _)| !direct)
+                {
+                    let node = state.copy_node(*self.render.node(), *target.device.node());
+                    transfer_modifiers = state.source_modifiers(node, target.format, buffer_size);
                     if state.device_lost {
                         return Err(Error::DeviceMissing);
                     }
                 }
-                if let (Some(modifiers), Some((_, dmabuf))) = (&transfer_modifiers, &target.cached_buffer) {
-                    if !modifiers.contains(&dmabuf.format().modifier) {
-                        // The async device initialization may have finished since the
-                        // CPU staging allocation. Negotiate a GLES/Vulkan-compatible
-                        // modifier rather than importing a guessed native layout.
-                        *target.cached_buffer = None;
+            }
+            #[cfg(feature = "backend_vulkan")]
+            if let (Some(modifiers), Some((_, old))) = (&transfer_modifiers, &target.cached_buffer) {
+                if !modifiers.is_empty()
+                    && !modifiers.contains(&old.format().modifier)
+                    && old.size() == buffer_size
+                    && old.format().code == target.format
+                {
+                    // Negotiate and bind a candidate before releasing a still-valid shared
+                    // source. A failed optimization must retain its actual-current fallback.
+                    let supported =
+                        Bind::<Dmabuf>::supported_formats(self.render.renderer()).unwrap_or_default();
+                    let modifiers = modifiers
+                        .iter()
+                        .copied()
+                        .filter(|modifier| {
+                            supported
+                                .iter()
+                                .any(|f| f.code == target.format && f.modifier == *modifier)
+                        })
+                        .collect::<Vec<_>>();
+                    if !modifiers.is_empty() {
+                        let candidate = (|| {
+                            let mut candidate = self
+                                .render
+                                .allocator()
+                                .create_buffer(
+                                    buffer_size.w as u32,
+                                    buffer_size.h as u32,
+                                    target.format,
+                                    &modifiers,
+                                )
+                                .map_err(Error::AllocatorError)?;
+                            if !modifiers.contains(&candidate.format().modifier)
+                                || candidate.size() != buffer_size
+                                || candidate.format().code != target.format
+                                || candidate.num_planes() != 1
+                            {
+                                return Err(Error::<R, T>::ImportFailed);
+                            }
+                            {
+                                let mut fb = self
+                                    .render
+                                    .renderer_mut()
+                                    .bind(&mut candidate)
+                                    .map_err(Error::Render)?;
+                                self.render
+                                    .renderer_mut()
+                                    .render(&mut fb, size, dst_transform)
+                                    .map_err(Error::Render)?;
+                            }
+                            Ok(candidate)
+                        })();
+                        match candidate {
+                            Ok(candidate) => {
+                                let shared = target
+                                    .device
+                                    .renderer_mut()
+                                    .import_dmabuf(&candidate, None)
+                                    .is_ok();
+                                *target.cached_buffer = Some((shared, candidate));
+                            }
+                            Err(err) => debug!(?err, "keeping valid source after Vulkan candidate rejection"),
+                        }
                     }
                 }
             }
@@ -1426,11 +1574,9 @@ where
                         let modifiers = {
                             if transfer_modifiers.is_none() {
                                 if let Some(state) = target.transfer.as_deref_mut() {
-                                    transfer_modifiers = state.source_modifiers(
-                                        *self.render.node(),
-                                        target.format,
-                                        buffer_size,
-                                    );
+                                    let node = state.copy_node(*self.render.node(), *target.device.node());
+                                    transfer_modifiers =
+                                        state.source_modifiers(node, target.format, buffer_size);
                                     if state.device_lost {
                                         return Err(Error::DeviceMissing);
                                     }
@@ -1443,9 +1589,8 @@ where
                                     .filter(|m| transfer_modifiers.contains(m))
                                     .collect::<Vec<_>>();
                                 if intersection.is_empty() {
-                                    if let Some(state) = target.transfer.as_deref_mut() {
-                                        state.disable();
-                                    }
+                                    // This format/extent has no usable source layout.
+                                    // Keep the engine alive for other outputs/formats.
                                     modifiers
                                 } else {
                                     intersection
@@ -1472,9 +1617,6 @@ where
                             warn!(
                                 "allocator did not honor the negotiated Vulkan source modifier; using CPU copy"
                             );
-                            if let Some(state) = target.transfer.as_deref_mut() {
-                                state.disable();
-                            }
                         }
 
                         {
@@ -1516,8 +1658,12 @@ where
                         .wait(&state.source_release)
                         .map_err(Error::Render)?;
                     drop(source_wait_timing);
-                    if !*direct {
-                        let _ = state.engine(*self.render.node());
+                    if !*direct || state.prefers_direct() {
+                        let node = state.copy_node(*self.render.node(), *target.device.node());
+                        let _ = state.engine(node);
+                        if state.device_lost {
+                            return Err(Error::DeviceMissing);
+                        }
                     }
                     transfer = Some(state);
                 }
@@ -1776,6 +1922,9 @@ where
             let render = unsafe { &mut *self.render };
             #[cfg(feature = "backend_vulkan")]
             if let Some(state) = self.target.as_ref().and_then(|target| target.transfer.as_deref()) {
+                if state.device_lost {
+                    return Err(Error::DeviceMissing);
+                }
                 let _source_wait_timing = timing::time(timing::Stage::SourceReuseWait);
                 render
                     .renderer_mut()
@@ -1856,42 +2005,6 @@ where
 
             let buffer_size = self.size.to_logical(1).to_buffer(1, Transform::Normal);
             if let Some(target) = self.target.as_mut() {
-                if let Some(texture) = target.texture.as_ref() {
-                    timing::count(timing::Counter::TextureCopies, 1);
-                    // try gpu copy
-                    let damage = damage
-                        .iter()
-                        .map(|rect| rect.to_logical(1, Transform::Normal, &buffer_size).to_physical(1))
-                        .collect::<Vec<_>>();
-                    let mut frame = target
-                        .device
-                        .renderer_mut()
-                        .render(target.framebuffer, self.size, Transform::Normal)
-                        .map_err(Error::Target)?;
-                    frame.wait(&sync).map_err(Error::Target)?;
-                    frame
-                        .clear(Color32F::TRANSPARENT, &damage)
-                        .map_err(Error::Target)?;
-                    frame
-                        .render_texture_from_to(
-                            texture,
-                            Rectangle::from_size(buffer_size).to_f64(),
-                            Rectangle::from_size(self.size),
-                            &damage,
-                            &[Rectangle::from_size(self.size)],
-                            Transform::Normal,
-                            1.0,
-                        )
-                        .map_err(Error::Target)?;
-                    let sync = frame.finish().map_err(Error::Target)?;
-                    render
-                        .renderer_mut()
-                        .cleanup_texture_cache()
-                        .map_err(Error::Render)?;
-
-                    return Ok(sync);
-                }
-
                 let format = if target
                     .device
                     .renderer()
@@ -1930,7 +2043,11 @@ where
                 if !copy_rects.is_empty() {
                     if let Some(state) = target.transfer.as_deref_mut() {
                         'transfer: {
-                            let modifiers = state.source_modifiers(self.node, target.format, buffer_size);
+                            if target.texture.is_some() && !state.prefers_direct() {
+                                break 'transfer;
+                            }
+                            let copy_node = state.copy_node(self.node, *target.device.node());
+                            let modifiers = state.source_modifiers(copy_node, target.format, buffer_size);
                             if state.device_lost {
                                 return Err(Error::DeviceMissing);
                             }
@@ -1941,6 +2058,12 @@ where
                                 // Initialization finished after rendering began. Keep this
                                 // frame on the CPU path; the next render negotiates storage.
                                 break 'transfer;
+                            }
+                            let destination_modifiers = state
+                                .destination_modifiers(copy_node, target.format, buffer_size)
+                                .unwrap_or_default();
+                            if state.device_lost {
+                                return Err(Error::DeviceMissing);
                             }
                             // This opt-in path writes the bound framebuffer itself, not an
                             // intermediate texture. In particular, the CPU copy rectangles
@@ -1955,14 +2078,15 @@ where
                                         .map_err(Error::Target)?
                                     {
                                         let destination = &external.dmabuf;
-                                        let eligible = destination.format().modifier == Modifier::Linear
+                                        let eligible = destination.format().modifier != Modifier::Invalid
+                                            && destination_modifiers.contains(&destination.format().modifier)
                                             && destination.num_planes() == 1
                                             && destination.size() == buffer_size
                                             && destination.format().code == target.source.format().code
                                             && destination.y_inverted() == target.source.y_inverted()
                                             && !state.direct_target_rejected(destination);
                                         if eligible {
-                                            match state.engine(self.node).unwrap().copy(
+                                            match state.engine(copy_node).unwrap().copy(
                                                 &target.source,
                                                 destination,
                                                 &sync,
@@ -2055,46 +2179,124 @@ where
                                     }
                                 }
                             }
-                            let destination = if let Some(destination) = &state.destination {
-                                destination.clone()
-                            } else {
-                                match target.device.allocator().create_buffer(
-                                    buffer_size.w as u32,
-                                    buffer_size.h as u32,
-                                    target.format,
-                                    &[Modifier::Linear],
-                                ) {
-                                    Ok(destination) => {
-                                        state.destination = Some(destination.clone());
-                                        destination
+                            // A direct rejection does not poison transport. Prefer the
+                            // working shared GLES reader over allocating an intermediate.
+                            if target.texture.is_some() {
+                                break 'transfer;
+                            }
+                            // Invalid is never an eligible destination layout; reserve it
+                            // as a whole-attempt cooldown after exhausting all candidates.
+                            if !state.intermediate_allowed(&target.source, Modifier::Invalid) {
+                                break 'transfer;
+                            }
+                            let sample_formats = target.device.renderer().dmabuf_formats();
+                            // Intermediate is sampled into the existing framebuffer, never
+                            // bound for rendering: ImportDma is the target capability contract.
+                            let mut destination_modifiers = destination_modifiers
+                                .into_iter()
+                                .filter(|modifier| {
+                                    *modifier != Modifier::Invalid
+                                        && sample_formats
+                                            .iter()
+                                            .any(|f| f.code == target.format && f.modifier == *modifier)
+                                })
+                                .collect::<Vec<_>>();
+                            transfer::order_destination_modifiers(
+                                state.copy_device,
+                                &mut destination_modifiers,
+                            );
+                            if destination_modifiers.is_empty() {
+                                break 'transfer;
+                            }
+                            // Keep a proven allocation first: do not replace a working pool
+                            // just because a previously rejected layout's retry timer expired.
+                            if let Some(destination) = &state.destination {
+                                if let Some(index) = destination_modifiers
+                                    .iter()
+                                    .position(|m| *m == destination.format().modifier)
+                                {
+                                    let modifier = destination_modifiers.remove(index);
+                                    destination_modifiers.insert(0, modifier);
+                                }
+                            }
+                            let mut prepared = None;
+                            for modifier in destination_modifiers {
+                                if !state.intermediate_allowed(&target.source, modifier) {
+                                    continue;
+                                }
+                                let cached = state
+                                    .destination
+                                    .as_ref()
+                                    .filter(|destination| destination.format().modifier == modifier)
+                                    .cloned();
+                                let destination = if let Some(destination) = cached {
+                                    destination
+                                } else {
+                                    // GBM does not promise list ordering: allocate exact layouts.
+                                    match target.device.allocator().create_buffer(
+                                        buffer_size.w as u32,
+                                        buffer_size.h as u32,
+                                        target.format,
+                                        &[modifier],
+                                    ) {
+                                        Ok(destination)
+                                            if destination.format().modifier == modifier
+                                                && destination.size() == buffer_size
+                                                && destination.format().code == target.format
+                                                && destination.num_planes() == 1 =>
+                                        {
+                                            destination
+                                        }
+                                        Ok(_) => {
+                                            warn!("allocator returned incompatible Vulkan destination");
+                                            state.defer_intermediate(&target.source, modifier, true);
+                                            continue;
+                                        }
+                                        Err(err) => {
+                                            debug!(
+                                                ?modifier,
+                                                ?err,
+                                                "Vulkan destination layout allocation failed"
+                                            );
+                                            state.defer_intermediate(&target.source, modifier, false);
+                                            continue;
+                                        }
+                                    }
+                                };
+                                // An import failure is pre-submit: try the remaining layouts.
+                                // No target-bound frame or Vulkan write exists on this candidate.
+                                let target_import_timing = timing::time(timing::Stage::TargetTextureImport);
+                                let imported = target
+                                    .device
+                                    .renderer_mut()
+                                    .import_dmabuf(&destination, Some(&copy_rects));
+                                drop(target_import_timing);
+                                match imported {
+                                    Ok(texture) => {
+                                        if state.destination.as_ref() != Some(&destination) {
+                                            state.discard_destination();
+                                            state.destination = Some(destination.clone());
+                                        }
+                                        prepared = Some((destination, texture));
+                                        break;
                                     }
                                     Err(err) => {
-                                        warn!(
-                                            "Vulkan transfer destination allocation failed, using CPU copy: {err}"
+                                        debug!(
+                                            ?modifier,
+                                            ?err,
+                                            "Vulkan target import failed; trying another layout"
                                         );
-                                        state.disable();
-                                        break 'transfer;
+                                        state.defer_intermediate(&target.source, modifier, false);
+                                        state.discard_destination();
                                     }
                                 }
-                            };
-                            // Probe target import before submitting any writes. This is an
-                            // intermediate texture, not a scanout buffer or a previous frame.
-                            let target_import_timing = timing::time(timing::Stage::TargetTextureImport);
-                            let target_import_result = target
-                                .device
-                                .renderer_mut()
-                                .import_dmabuf(&destination, Some(&copy_rects));
-                            drop(target_import_timing);
-                            let texture = match target_import_result {
-                                Ok(texture) => texture,
-                                Err(err) => {
-                                    warn!("Vulkan transfer target import failed, using CPU copy: {err}");
-                                    state.disable();
-                                    break 'transfer;
-                                }
+                            }
+                            let Some((destination, texture)) = prepared else {
+                                state.defer_intermediate(&target.source, Modifier::Invalid, false);
+                                break 'transfer;
                             };
                             let destination_release = state.destination_release.clone();
-                            let copy_sync = match state.engine(self.node).unwrap().copy(
+                            let copy_sync = match state.engine(copy_node).unwrap().copy(
                                 &target.source,
                                 &destination,
                                 &sync,
@@ -2109,8 +2311,13 @@ where
                                         state.disable();
                                         return Err(Error::DeviceMissing);
                                     }
-                                    warn!("Vulkan transfer failed, using CPU copy: {err}");
-                                    state.disable();
+                                    debug!(?err, "Vulkan transfer failed before submission; using CPU copy");
+                                    state.defer_intermediate(
+                                        &target.source,
+                                        destination.format().modifier,
+                                        transfer::cache_direct_rejection(&err),
+                                    );
+                                    state.discard_destination();
                                     break 'transfer;
                                 }
                             };
@@ -2168,6 +2375,62 @@ where
                             return Ok(target_sync);
                         }
                     }
+                }
+
+                // The texture always belongs to this frame's actual source allocation.
+                // Explicit target-copy preference may try Vulkan first, but never removes
+                // this working GPU fallback when the direct destination is unsupported.
+                if let Some(texture) = target.texture.as_ref() {
+                    if damage.is_empty() {
+                        render
+                            .renderer_mut()
+                            .cleanup_texture_cache()
+                            .map_err(Error::Render)?;
+                        return Ok(target.completion.current());
+                    }
+                    timing::count(timing::Counter::TextureCopies, 1);
+                    let damage = damage
+                        .iter()
+                        .map(|rect| rect.to_logical(1, Transform::Normal, &buffer_size).to_physical(1))
+                        .collect::<Vec<_>>();
+                    let mut frame = target
+                        .device
+                        .renderer_mut()
+                        .render(target.framebuffer, self.size, Transform::Normal)
+                        .map_err(Error::Target)?;
+                    let draw_result = (|| {
+                        frame.wait(&sync).map_err(Error::Target)?;
+                        frame
+                            .clear(Color32F::TRANSPARENT, &damage)
+                            .map_err(Error::Target)?;
+                        frame
+                            .render_texture_from_to(
+                                texture,
+                                Rectangle::from_size(buffer_size).to_f64(),
+                                Rectangle::from_size(self.size),
+                                &damage,
+                                &[Rectangle::from_size(self.size)],
+                                Transform::Normal,
+                                1.0,
+                            )
+                            .map_err(Error::Target)
+                    })();
+                    let finished = frame.finish().map_err(Error::Target);
+                    #[cfg(feature = "backend_vulkan")]
+                    if let Some(state) = target.transfer.as_deref_mut() {
+                        match &finished {
+                            Ok(sync) => state.source_release = sync.clone(),
+                            // No trustworthy reader fence: do not permit source reuse.
+                            Err(_) => state.device_lost = true,
+                        }
+                    }
+                    let sync = finished?;
+                    draw_result?;
+                    render
+                        .renderer_mut()
+                        .cleanup_texture_cache()
+                        .map_err(Error::Render)?;
+                    return Ok(sync);
                 }
 
                 timing::count(timing::Counter::CpuCopies, u64::from(!copy_rects.is_empty()));
