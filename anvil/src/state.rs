@@ -92,7 +92,7 @@ use smithay::{
         single_pixel_buffer::SinglePixelBufferState,
         socket::ListeningSocketSource,
         tablet_manager::TabletManagerState,
-        text_input::TextInputManagerState,
+        text_input::{TextInputActivation, TextInputManagerState},
         viewporter::ViewporterState,
         virtual_keyboard::VirtualKeyboardManagerState,
         xdg_activation::{
@@ -398,7 +398,7 @@ impl<BackendData: Backend> PointerConstraintsHandler for AnvilState<BackendData>
 
         match constraint_remove {
             ConstraintRemove::Destroyed(pointer_constraint) => match pointer_constraint {
-                PointerConstraint::Confined(_confined_pointer) => return,
+                PointerConstraint::Confined(_confined_pointer) => {}
                 PointerConstraint::Locked(locked_pointer) => {
                     let origin = self
                         .space
@@ -420,7 +420,7 @@ impl<BackendData: Backend> PointerConstraintsHandler for AnvilState<BackendData>
                     }
                 }
             },
-            ConstraintRemove::PointerLeave(_region) => return,
+            ConstraintRemove::PointerLeave(_region) => {}
         }
     }
 
@@ -437,6 +437,8 @@ impl<BackendData: Backend> PointerConstraintsHandler for AnvilState<BackendData>
         }
     }
 }
+
+impl<BackendData: Backend> TextInputActivation for AnvilState<BackendData> {}
 
 impl<BackendData: Backend> XdgActivationHandler for AnvilState<BackendData> {
     fn activation_state(&mut self) -> &mut XdgActivationState {

@@ -139,12 +139,7 @@ impl<D: TabletSeatHandler + 'static> TabletToolHandle<D> {
 
     /// Check if this tablet tool is currently grabbed with this serial
     pub fn has_grab(&self, serial: Serial) -> bool {
-        let guard = self.arc.inner.lock().unwrap();
-
-        match guard.grab {
-            GrabStatus::Active(s, _) => s == serial,
-            _ => false,
-        }
+        self.with_grab(|s, _| s == serial).unwrap_or(false)
     }
 
     /// Check if this tablet tool is currently being grabbed.
@@ -155,11 +150,7 @@ impl<D: TabletSeatHandler + 'static> TabletToolHandle<D> {
 
     /// Return the start data for the grab, if any.
     pub fn grab_start_data(&self) -> Option<GrabStartData<D>> {
-        let guard = self.arc.inner.lock().unwrap();
-        match &guard.grab {
-            GrabStatus::Active(_, g) => Some(g.start_data().clone()),
-            _ => None,
-        }
+        self.with_grab(|_, g| g.start_data().clone())
     }
 
     /// Call `f` with the active grab, if any.
@@ -914,6 +905,17 @@ impl<D: TabletSeatHandler + 'static> TabletToolInternal<D> {
             }
 
             if self.tip_down {
+                // Compat with other compositors, more on this in https://github.com/Smithay/smithay/pull/1851
+                // tldr: Spec-wise there is no reason to send this, but some clients depend on this
+                focused.axis(
+                    seat,
+                    data,
+                    descriptor,
+                    AxisFrame {
+                        pressure: Some(0.0),
+                        ..Default::default()
+                    },
+                );
                 focused.up(
                     seat,
                     data,
@@ -1013,6 +1015,17 @@ impl<D: TabletSeatHandler + 'static> TabletToolInternal<D> {
     fn up(&mut self, data: &mut D, seat: &Seat<D>, descriptor: &TabletToolDescriptor, event: &UpEvent) {
         if self.tip_down {
             if let Some((focused, _)) = self.focus.as_mut() {
+                // Compat with other compositors, more on this in https://github.com/Smithay/smithay/pull/1851
+                // tldr: Spec-wise there is no reason to send this, but some clients depend on this
+                focused.axis(
+                    seat,
+                    data,
+                    descriptor,
+                    AxisFrame {
+                        pressure: Some(0.0),
+                        ..Default::default()
+                    },
+                );
                 focused.up(seat, data, descriptor, event);
             }
         }
